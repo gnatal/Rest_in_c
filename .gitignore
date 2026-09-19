@@ -1,0 +1,21 @@
+# Build output
+build/
+bin/
+*.o
+*.d
+*.a
+*.so
+*.dylib
+
+# Target executable
+rest_api
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Environment files
+.env
