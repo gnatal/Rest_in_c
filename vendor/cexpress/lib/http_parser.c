@@ -4,7 +4,6 @@
 #include <strings.h>
 #include "http_parser.h"
 
-static void parse_headers_n(const char *block, size_t len, Request *req);
 
 /* ---- byte-level helpers (all bounded by an explicit length) ---- */
 
@@ -28,64 +27,161 @@ static void copy_bounded(char *dst, const size_t dst_size, const char *src, size
     dst[len] = '\0';
 }
 
-/* Percent-decodes src[0..src_len) into dst (dst_size bytes incl. NUL). dst may equal src:
- * output is never longer than input, so the write cursor never overtakes the read cursor. */
-static void decode_bounded(char *dst, const size_t dst_size, const char *src, const size_t src_len,
-                           const int decode_plus) {
+/*
+ * Percent-decodes src[0..src_len) into dst (dst_size bytes incl. NUL). dst may equal src: output is
+ * never longer than input, so the write cursor never overtakes the read cursor. Returns 0 on success,
+ * -1 if a decoded byte is NUL (a raw NUL byte, or "%00", decoded into the middle of dst - dst is
+ * still fully written and NUL-terminated in that case, but every C-string function downstream
+ * (strlen, strcmp, the router, a handler's own strstr/strcmp on req->path) would silently see only the
+ * bytes up to that NUL, treating "/style.css%00.png" as "/style.css" with no error and no indication
+ * anything was cut. Callers must reject such input (400) rather than use dst). -2 if dst filled up
+ * before src was consumed (dst holds the NUL-terminated prefix); path decoding sizes dst so this cannot
+ * happen, the query string keeps the prefix, url_decode_span's callers reject it. */
+static int decode_bounded(char *dst, const size_t dst_size, const char *src, const size_t src_len,
+                          const int decode_plus) {
     if (dst_size == 0) {
-        return;
+        return 0;
     }
     size_t out = 0;
-    for (size_t i = 0; i < src_len && out + 1 < dst_size; i++) {
+    int has_embedded_nul = 0;
+    size_t i = 0;
+    for (; i < src_len && out + 1 < dst_size; i++) {
+        char c;
         if (src[i] == '%' && i + 2 < src_len && hex_value(src[i + 1]) >= 0 && hex_value(src[i + 2]) >= 0) {
-            dst[out++] = (char)((hex_value(src[i + 1]) << 4) | hex_value(src[i + 2]));
+            c = (char)((hex_value(src[i + 1]) << 4) | hex_value(src[i + 2]));
             i += 2;
         } else if (src[i] == '+' && decode_plus) {
-            dst[out++] = ' ';
+            c = ' ';
         } else {
-            dst[out++] = src[i];
+            c = src[i];
         }
+        if (c == '\0') {
+            has_embedded_nul = 1;
+        }
+        dst[out++] = c;
     }
     dst[out] = '\0';
-}
-
-void url_decode(const char *src, char *dst, const size_t dst_size, const int decode_plus) {
-    decode_bounded(dst, dst_size, src, strlen(src), decode_plus);
-}
-
-/* Pointer to the "\r\n\r\n" ending the header block in buf[0..len), or NULL. Hops between '\n'
- * bytes with memchr (header lines are short) instead of a generic substring search. */
-static const char *find_header_end(const char *buf, const size_t len) {
-    const char *p = buf;
-    const char *end = buf + len;
-    while (p < end) {
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (nl == NULL) {
-            return NULL;
-        }
-        if (nl - buf >= 3 && nl[-1] == '\r' && nl[-2] == '\n' && nl[-3] == '\r') {
-            return nl - 3;
-        }
-        p = nl + 1;
+    if (has_embedded_nul) {
+        return -1;
     }
-    return NULL;
+    return i < src_len ? -2 : 0;
 }
 
-/* End of the header line starting at p: pointer to its "\r\n", or `end` if the
- * line is unterminated. Never reads outside [p, end). */
-static const char *find_line_end(const char *p, const char *end) {
-    while (p < end) {
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (nl == NULL) {
-            return end;
-        }
-        if (nl > p && nl[-1] == '\r') {
-            return nl - 1;
-        }
-        p = nl + 1;
-    }
-    return end;
+int url_decode(const char *src, char *dst, const size_t dst_size, const int decode_plus) {
+    return decode_bounded(dst, dst_size, src, strlen(src), decode_plus) == -1 ? -1 : 0;
 }
+
+int url_decode_span(const char *src, const size_t src_len, char *dst, const size_t dst_size, const int decode_plus) {
+    return decode_bounded(dst, dst_size, src, src_len, decode_plus);
+}
+
+/* ---- path canonicalization ---- */
+
+/* True when raw[0..len) contains "%2F"/"%2f" - an encoded '/' that would decode into a new segment. */
+static int has_encoded_slash(const char *raw, const size_t len) {
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (raw[i] == '%' && raw[i + 1] == '2' && (raw[i + 2] == 'F' || raw[i + 2] == 'f')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int path_canonicalize(char *path) {
+    if (path[0] == '*' && path[1] == '\0') {
+        return 0; /* asterisk-form ("OPTIONS *"): no segments to canonicalize */
+    }
+    if (path[0] != '/') {
+        return -1;
+    }
+    size_t out = 0;
+    size_t in = 0;
+    while (path[in] != '\0') {
+        while (path[in] == '/') {
+            in++;
+        }
+        const size_t seg_start = in;
+        while (path[in] != '\0' && path[in] != '/') {
+            in++;
+        }
+        const size_t seg_len = in - seg_start;
+        if (seg_len == 0) {
+            break; /* only slashes were left: at most one trailing '/' is kept below */
+        }
+        if ((seg_len == 1 && path[seg_start] == '.') ||
+            (seg_len == 2 && path[seg_start] == '.' && path[seg_start + 1] == '.')) {
+            return -1;
+        }
+        path[out++] = '/';
+        memmove(path + out, path + seg_start, seg_len);
+        out += seg_len;
+    }
+    if (out == 0 || path[in - 1] == '/') {
+        path[out++] = '/';
+    }
+    path[out] = '\0';
+    return 0;
+}
+
+void path_normalize_prefix(const char *prefix, char *out, const size_t out_size) {
+    size_t len = 0;
+    const char *p = prefix != NULL ? prefix : "";
+    while (*p != '\0') {
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        const char *seg = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+        const size_t seg_len = (size_t)(p - seg);
+        if (len + 1 + seg_len >= out_size) {
+            break; /* truncate at a segment boundary rather than mid-segment */
+        }
+        out[len++] = '/';
+        memcpy(out + len, seg, seg_len);
+        len += seg_len;
+    }
+    out[len] = '\0';
+}
+
+int request_target_path(const char *target, const size_t target_len, char *out, const size_t out_size) {
+    const char *qmark = memchr(target, '?', target_len);
+    const size_t p_len = qmark ? (size_t)(qmark - target) : target_len;
+    if (p_len >= out_size) return -2;
+
+    /* an encoded '/' would decode into a segment boundary the raw bytes never had. */
+    if (has_encoded_slash(target, p_len)) return -4;
+
+    /* "%00" (or a raw NUL byte) decoded into the middle of the path - a filter that checks the
+     * path's suffix/extension before using it (e.g. a static-file extension check) would see only
+     * the bytes up to the NUL, so "/style.css%00.png" would look like "/style.css". Rejected
+     * outright rather than routed on a silently truncated path. */
+    if (decode_bounded(out, out_size, target, p_len, 0) != 0) return -4;
+
+    /* the router skips empty segments, so "//admin/x" and "/admin/x" reach the same route; every
+     * prefix match (middleware, body limits) must see the same shape or it is bypassed. */
+    if (path_canonicalize(out) != 0) return -4;
+    return 0;
+}
+
+int path_prefix_matches(const char *prefix, const char *path) {
+    if (prefix[0] == '\0') {
+        return 1;
+    }
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return 0;
+    }
+    const char next = path[prefix_len];
+    return next == '\0' || next == '/';
+}
+
+
+#include "vendor/picohttpparser/picohttpparser.h"
 
 /* True when the comma-separated header value contains token (case-insensitive). */
 static int list_has_token(const char *value, const char *token) {
@@ -106,19 +202,208 @@ static int list_has_token(const char *value, const char *token) {
     return 0;
 }
 
+/* True (1) when v[0..end) is a comma-separated list with exactly one non-empty token and that token
+ * case-insensitively equals token[0..token_len) - not merely "token appears somewhere in the list"
+ * (list_has_token, above), which is the wrong question for Transfer-Encoding: this engine
+ * implements exactly one transfer-coding, "chunked", named alone, and a bare substring/list-membership
+ * search used to also accept "Transfer-Encoding: xchunked" (substring match with no token boundary) and
+ * "Transfer-Encoding: gzip, chunked" (chunked present, but silently ignoring the gzip coding this engine
+ * never decodes) as if the body were framed as plain chunked. v need not be NUL-terminated. */
+static int is_sole_token(const char *v, const char *end, const char *token, const size_t token_len) {
+    int count = 0;
+    int last_matches = 0;
+    while (v < end) {
+        while (v < end && (*v == ',' || is_ows(*v))) v++;
+        const char *start = v;
+        while (v < end && *v != ',' && !is_ows(*v)) v++;
+        const size_t tok_len = (size_t)(v - start);
+        if (tok_len == 0) continue;
+        count++;
+        last_matches = (tok_len == token_len && strncasecmp(start, token, token_len) == 0);
+    }
+    return count == 1 && last_matches;
+}
+
+/* True (1) when block[0..len) - a header block, a request line + headers, or any prefix of either -
+ * contains a '\n' not immediately preceded by '\r'. picohttpparser tolerates a bare '\n' as a line
+ * terminator anywhere one is expected (the request line, any header line, the final blank line) - lenient
+ * parsing that a front proxy reading strictly per RFC 9112 (CRLF only) would not extend the same
+ * tolerance to, so the two could disagree about where one request ends and the next begins. Called only
+ * once a complete header block has been located (header_len > 0); scanning a still-incomplete prefix
+ * would flag a lone '\n' that a not-yet-arrived '\r' would have paired with. */
+static int has_bare_lf(const char *block, const size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (block[i] == '\n' && (i == 0 || block[i - 1] != '\r')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* true (1) when buf[0..len) contains a blank line - a '\n' followed by "\n" or "\r\n", every line
+ * ending picohttpparser accepts. A valid head ends at its first blank line, so when picohttpparser still
+ * reports "incomplete" (-2) past one, no later byte can make the head valid. picohttpparser does that for
+ * a short version token: parse_http_version asks for 9 bytes before looking at any of them, so
+ * "GET / X\r\n\r\n" was "incomplete" forever and went unanswered until the request header deadline.
+ * Starts at *scan_from; on 0 stores where the next call over a longer buf must restart: 2 bytes before
+ * len, since a blank line that began there ("\n\r" + a missing "\n") was not visible yet. Every earlier
+ * byte is known not to start one, so each head byte is searched a bounded number of times in total. */
+static int has_blank_line_from(const char *buf, const size_t len, size_t *scan_from) {
+    const char *p = buf + (*scan_from < len ? *scan_from : len);
+    const char *const end = buf + len;
+    const char *nl;
+    while ((nl = memchr(p, '\n', (size_t)(end - p))) != NULL) {
+        if (nl + 1 < end && (nl[1] == '\n' || (nl[1] == '\r' && nl + 2 < end && nl[2] == '\n'))) {
+            return 1;
+        }
+        p = nl + 1;
+    }
+    *scan_from = len > 2 ? len - 2 : 0;
+    return 0;
+}
+
 /* ---- message framing (Content-Length / Transfer-Encoding) ---- */
 
-/*
- * Line-anchored scan of a header block for the two framing headers. A header
- * counts only when its *name* (text before the first ':') equals the header
- * name exactly (case-insensitive), so "X-Content-Length: 9" or a request-line
- * target containing "Content-Length:" never match. Stops at the first blank
- * line, so a raw buffer that continues into a body is safe to pass.
- *
- * Returns the Content-Length code: 0 absent-or-zero, >0 value, -1 malformed or
- * conflicting duplicates, -2 above MAX_BODY_SIZE. *has_cl_out / *chunked_out
- * report header presence.
- */
+/* Shared by parse_request_head: derives the Content-Length / Transfer-Encoding framing verdict from an
+ * already-tokenized header array (this used to be inlined once in request_framing and duplicated,
+ * differently, a second time inside parse_http_request; now there is exactly one copy). */
+static int compute_content_length_and_chunked(const struct phr_header *headers, const size_t num_headers,
+                                               int *chunked_out) {
+    *chunked_out = 0;
+    int content_length = 0;
+    int has_cl = 0;
+    int te_unsupported = 0;
+
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name_len == 14 && strncasecmp(headers[i].name, "Content-Length", 14) == 0) {
+            long long acc = 0;
+            const char *v = headers[i].value;
+            size_t v_len = headers[i].value_len;
+            size_t j = 0;
+            while (j < v_len && (v[j] == ' ' || v[j] == '\t')) j++;
+            if (j < v_len && v[j] == '-') {
+                has_cl = 1; content_length = -1;
+            } else if (j == v_len || v[j] < '0' || v[j] > '9') {
+                has_cl = 1; content_length = -1;
+            } else {
+                while (j < v_len && v[j] >= '0' && v[j] <= '9') {
+                    if (acc <= MAX_BODY_SIZE) acc = acc * 10 + (v[j] - '0');
+                    j++;
+                }
+                while (j < v_len && (v[j] == ' ' || v[j] == '\t')) j++;
+                int val = (j != v_len) ? -1 : (acc > MAX_BODY_SIZE ? -2 : (int)acc);
+                if (has_cl && val != content_length) content_length = -1;
+                else if (!has_cl) content_length = val;
+                has_cl = 1;
+            }
+        } else if (headers[i].name_len == 17 && strncasecmp(headers[i].name, "Transfer-Encoding", 17) == 0) {
+            /* token-exact match, not a substring search - "chunked" must be the value's one and
+             * only transfer-coding (checked per header instance, so a value split across duplicate
+             * Transfer-Encoding headers, e.g. "gzip" on one line and "chunked" on another, is caught
+             * too: neither instance alone is the sole token "chunked"). Anything else this engine
+             * cannot frame (empty, multiple codings, or a single unsupported one like "gzip") flags
+             * te_unsupported instead of silently being ignored or mistaken for chunked framing. */
+            if (is_sole_token(headers[i].value, headers[i].value + headers[i].value_len, "chunked", 7)) {
+                *chunked_out = 1;
+            } else {
+                te_unsupported = 1;
+            }
+        }
+    }
+
+    if (te_unsupported) return -3; /* -> 501, "Transfer-Encoding" names a coding this engine can't frame */
+    if (*chunked_out && has_cl) return -1;
+    return content_length;
+}
+
+int parse_request_head(const char *buf, const size_t len, ParsedHead *head) {
+    size_t head_scan = 0;
+    return parse_request_head_resume(buf, len, head, &head_scan);
+}
+
+int parse_request_head_resume(const char *buf, const size_t len, ParsedHead *head, size_t *head_scan) {
+    head->header_len = 0;
+    head->method = NULL;
+    head->method_len = 0;
+    head->path = NULL;
+    head->path_len = 0;
+    head->minor_version = 0;
+    head->content_length = 0;
+    head->chunked = 0;
+    head->num_headers = MAX_FRAMING_HEADERS;
+
+    /* Incomplete until a blank line has arrived: past the first look at a request, picohttpparser only
+     * runs once one has, so a head that trickles in one byte per recv costs one incremental blank-line
+     * search per recv plus a single parse, instead of a full re-parse from byte 0 on every recv
+     * (quadratic in the head size). The first look (*head_scan == 0) parses straight away, so a request
+     * that arrives whole is still a single pass: a complete head (res > 0) proves its blank line exists.
+     * The verdict is the same whichever way recv split the bytes. The price is that a request line or
+     * header picohttpparser would already reject is answered (400) only once its blank line arrives,
+     * or with 431 at BUF_SIZE / at the request header deadline if it never does. */
+    int res = -2;
+    const int first_look = *head_scan == 0;
+    if (first_look) {
+        res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
+                                &head->minor_version, head->headers, &head->num_headers, 0);
+    }
+    if (res < 0) {
+        if (!has_blank_line_from(buf, len, head_scan)) return 0; /* header_len and content_length still 0 */
+        if (!first_look) {
+            res = phr_parse_request(buf, len, &head->method, &head->method_len, &head->path, &head->path_len,
+                                    &head->minor_version, head->headers, &head->num_headers, 0);
+        }
+    }
+
+    /* A blank line is present, so "incomplete" (-2) cannot become valid with more bytes (see
+     * has_blank_line_from): it takes the malformed path below along with -1. */
+    if (res < 0) {
+        /* Malformed request line: header_len stays 0 too, distinguished from "incomplete" only by this
+         * return value - content_length is set to -1 here (rather than left at its 0 default) precisely
+         * so request_head_is_complete can tell the two apart despite both having header_len == 0. */
+        head->content_length = -1;
+        return -1;
+    }
+
+    /* picohttpparser itself accepts a bare '\n' as a line terminator throughout the request line
+     * and header block; reject that ambiguity here rather than let it through - same "malformed"
+     * contract as res == -1 above (header_len stays 0, content_length is -1), since a proxy reading
+     * strictly per RFC 9112 could disagree with this parser about where the request ends. */
+    if (has_bare_lf(buf, (size_t)res)) {
+        head->content_length = -1;
+        return -1;
+    }
+
+    head->header_len = (size_t)res;
+    head->content_length = compute_content_length_and_chunked(head->headers, head->num_headers, &head->chunked);
+    return head->content_length;
+}
+
+int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out,
+                    const char **path_out, size_t *path_len_out) {
+    ParsedHead head;
+    const int result = parse_request_head(buf, len, &head);
+    *header_len_out = head.header_len;
+    *chunked_out = head.chunked;
+    if (path_out != NULL) *path_out = head.path;
+    if (path_len_out != NULL) *path_len_out = head.path_len;
+    return result;
+}
+
+
+
+
+
+
+
+
+static const char *find_line_end(const char *buf, const char *end) {
+    const char *p = memchr(buf, '\r', (size_t)(end - buf));
+    if (p != NULL && p + 1 < end && *(p + 1) == '\n') {
+        return p;
+    }
+    return end;
+}
+
 static int scan_framing(const char *block, const size_t len, int *has_cl_out, int *chunked_out) {
     const char *p = block;
     const char *end = block + len;
@@ -128,70 +413,42 @@ static int scan_framing(const char *block, const size_t len, int *has_cl_out, in
 
     while (p < end) {
         const char *le = find_line_end(p, end);
-        if (le == p) {
-            break; /* blank line: end of the header block */
-        }
+        if (le == p) break;
         const char *colon = memchr(p, ':', (size_t)(le - p));
         if (colon != NULL) {
             const size_t name_len = (size_t)(colon - p);
             const char *v = colon + 1;
-            while (v < le && is_ows(*v)) {
-                v++;
-            }
+            while (v < le && is_ows(*v)) v++;
 
             if (name_len == 14 && strncasecmp(p, "Content-Length", 14) == 0) {
                 int value = 0;
-                if (v < le && *v == '-') {
-                    value = -1;
-                } else if (v == le || *v < '0' || *v > '9') {
-                    value = -1;
-                } else {
+                if (v < le && *v == '-') value = -1;
+                else if (v == le || *v < '0' || *v > '9') value = -1;
+                else {
                     long long acc = 0;
                     while (v < le && *v >= '0' && *v <= '9') {
-                        if (acc <= MAX_BODY_SIZE) {
-                            acc = acc * 10 + (*v - '0');
-                        }
+                        if (acc <= MAX_BODY_SIZE) acc = acc * 10 + (*v - '0');
                         v++;
                     }
-                    while (v < le && is_ows(*v)) {
-                        v++;
-                    }
-                    if (v != le) {
-                        value = -1; /* trailing garbage, e.g. "5abc" or "5, 5" */
-                    } else if (acc > MAX_BODY_SIZE) {
-                        value = -2;
-                    } else {
-                        value = (int)acc;
-                    }
+                    while (v < le && is_ows(*v)) v++;
+                    if (v != le) value = -1;
+                    else if (acc > MAX_BODY_SIZE) value = -2;
+                    else value = (int)acc;
                 }
-
-                if (has_cl && value != result) {
-                    result = -1; /* conflicting duplicate Content-Length headers */
-                } else if (!has_cl) {
-                    result = value;
-                }
+                if (has_cl && value != result) result = -1;
+                else if (!has_cl) result = value;
                 has_cl = 1;
             } else if (name_len == 17 && strncasecmp(p, "Transfer-Encoding", 17) == 0) {
-                for (const char *q = v; (size_t)(le - q) >= 7; q++) {
-                    if (strncasecmp(q, "chunked", 7) == 0) {
-                        chunked = 1;
-                        break;
-                    }
-                }
+                /* token-exact match (see is_sole_token), not a bare substring search - this used to
+                 * also match "Transfer-Encoding: xchunked" or treat "gzip, chunked" as plain chunked. */
+                if (is_sole_token(v, le, "chunked", 7)) chunked = 1;
             }
         }
-        if (le >= end) {
-            break;
-        }
+        if (le >= end) break;
         p = le + 2;
     }
-
-    if (has_cl_out != NULL) {
-        *has_cl_out = has_cl;
-    }
-    if (chunked_out != NULL) {
-        *chunked_out = chunked;
-    }
+    if (has_cl_out != NULL) *has_cl_out = has_cl;
+    if (chunked_out != NULL) *chunked_out = chunked;
     return result;
 }
 
@@ -205,77 +462,76 @@ int request_has_chunked_encoding(const char *header_block) {
     return chunked;
 }
 
-int request_framing(const char *buf, const size_t len, size_t *header_len_out, int *chunked_out) {
-    *header_len_out = 0;
-    *chunked_out = 0;
 
-    const char *terminator = find_header_end(buf, len);
-    if (terminator == NULL) {
-        return 0;
-    }
-    *header_len_out = (size_t)(terminator + 4 - buf);
-
-    const char *first_line_end = memchr(buf, '\r', (size_t)(terminator - buf));
-    const char *block = first_line_end != NULL ? first_line_end + 2 : terminator;
-    if (block > terminator) {
-        block = terminator; /* zero header lines: the request line's CRLF starts the terminator */
-    }
-
-    int has_cl = 0;
-    const int content_length = scan_framing(block, (size_t)(terminator - block), &has_cl, chunked_out);
-    if (*chunked_out && has_cl) {
-        return -1; /* RFC 7230 3.3.3: request-smuggling shape, rejected by parse_http_request */
-    }
-    return content_length;
-}
-
-int request_is_complete(const char *buf, const size_t len) {
-    size_t header_len;
-    int chunked;
-    const int content_length = request_framing(buf, len, &header_len, &chunked);
-    if (header_len == 0) {
-        return 0;
-    }
-    if (content_length < 0) {
-        return 1; /* stop buffering; parse_http_request turns this into 400/413 */
-    }
-
-    const size_t body_have = len - header_len;
-    if (chunked) {
-        size_t decoded_len;
-        /* 1 = complete, -1/-2 = rejected: all stop buffering. Only 0 means "need more". */
-        return chunked_body_scan(buf + header_len, body_have, MAX_BODY_SIZE, &decoded_len) != 0;
-    }
-    return body_have >= (size_t)content_length;
-}
 
 int request_wants_close(const Request *req) {
     const char *connection = req_get_header(req, "Connection");
     if (connection != NULL) {
-        if (list_has_token(connection, "close")) {
-            return 1;
-        }
-        if (list_has_token(connection, "keep-alive")) {
-            return 0;
-        }
+        if (list_has_token(connection, "close")) return 1;
+        if (list_has_token(connection, "keep-alive")) return 0;
     }
     return strcmp(req->version, "HTTP/1.1") != 0;
 }
 
-/* ---- request parsing ---- */
 
-/* Skips spaces from p (bounded by end), returns the first non-space. */
-static const char *skip_spaces(const char *p, const char *end) {
-    while (p < end && *p == ' ') {
-        p++;
+int request_head_is_complete(const ParsedHead *head, const char *buf, const size_t len, ChunkScanState *chunk_scan) {
+    /* a malformed request line (picohttpparser's -1) leaves header_len at 0, the same as a genuinely
+     * incomplete request - checking content_length < 0 first tells them apart, since parse_request_head
+     * sets content_length to -1 only on the malformed path (an incomplete parse leaves it at its 0
+     * default). Reporting "complete" here lets the malformed request reach parse_http_request_from_head
+     * for an immediate 400, instead of waiting forever for headers that will never arrive. */
+    if (head->content_length < 0) return 1;
+    if (head->header_len == 0) return 0;
+
+    const size_t body_have = len - head->header_len;
+    if (head->chunked) {
+        size_t decoded_len;
+        ChunkScanState from_scratch = {0};
+        ChunkScanState *state = chunk_scan != NULL ? chunk_scan : &from_scratch;
+        return chunked_body_scan_resume(buf + head->header_len, body_have, MAX_BODY_SIZE, state, &decoded_len) != 0;
     }
-    return p;
+    return body_have >= (size_t)head->content_length;
 }
 
-int parse_http_request(const char *raw, const size_t raw_len, Request *req) {
-    /* Initialize only what accessors read. The arrays behind the *_count fields
-     * are never read past their count and every slot is NUL-terminated when
-     * written, so zeroing the whole ~19 KB struct per request is unnecessary. */
+size_t request_wire_len(const ParsedHead *head, const ChunkScanState *chunk_scan) {
+    if (head->chunked) {
+        return head->header_len + chunk_scan->body_end;
+    }
+    return head->header_len + (size_t)head->content_length;
+}
+
+int request_head_expects_continue(const ParsedHead *head) {
+    if (head->header_len == 0 || head->minor_version < 1) {
+        return 0; /* incomplete/malformed, or HTTP/1.0: RFC 9110 §15.2 - never send a 1xx to a 1.0 client */
+    }
+    if (head->content_length < 0 || (!head->chunked && head->content_length == 0)) {
+        return 0; /* no body to wait for, or framing already invalid (answered without reading a body) */
+    }
+    for (size_t i = 0; i < head->num_headers; i++) {
+        const struct phr_header *h = &head->headers[i];
+        if (h->name == NULL || h->name_len != 6 || strncasecmp(h->name, "Expect", 6) != 0) {
+            continue;
+        }
+        const char *v = h->value;
+        const char *end = h->value + h->value_len;
+        while (v < end && is_ows(*v)) v++;
+        while (end > v && is_ows(end[-1])) end--;
+        if ((size_t)(end - v) == 12 && strncasecmp(v, "100-continue", 12) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int request_is_complete(const char *buf, const size_t len) {
+    ParsedHead head;
+    parse_request_head(buf, len, &head);
+    return request_head_is_complete(&head, buf, len, NULL);
+}
+
+/* ---- request parsing ---- */
+
+static void reset_request(Request *req, Arena *arena) {
     req->method[0] = '\0';
     req->path[0] = '\0';
     req->query[0] = '\0';
@@ -284,184 +540,202 @@ int parse_http_request(const char *raw, const size_t raw_len, Request *req) {
     req->query_count = 0;
     req->header_count = 0;
     req->cookie_count = 0;
+    req->cookies_parsed = 0;
     req->content_length = 0;
     req->body = NULL;
+    /* set even on a parse that goes on to fail - req_get_header/req_get_cookie need it to
+     * materialize a value regardless of how far parsing got, and there is no reason to leave it
+     * dangling from whatever a reused stack Request last held. */
+    req->arena = arena;
+}
 
-    const char *header_end = find_header_end(raw, raw_len);
-    if (header_end == NULL) {
-        return -1;
-    }
-    const char *line_end = find_line_end(raw, header_end + 2);
-    if (line_end >= header_end + 2) {
-        return -1; /* no CRLF-terminated request line */
-    }
+/* Everything but the body: method, path, query, header views, framing verdict. 0 when the body can
+ * be attached next, else the parse_http_request return code (req->content_length carries -2/-3). */
+static int parse_request_fields(const ParsedHead *head, Request *req, Arena *arena) {
+    reset_request(req, arena);
 
-    /* Request line: METHOD SP target [SP version] */
-    const char *p = raw;
-    const char *sp = memchr(p, ' ', (size_t)(line_end - p));
-    if (sp == NULL || sp == p || (size_t)(sp - p) >= sizeof(req->method)) {
-        return -1; /* no method, or a method token that would not fit (was silently truncated) */
-    }
-    copy_bounded(req->method, sizeof(req->method), p, (size_t)(sp - p));
-
-    const char *target = skip_spaces(sp, line_end);
-    const char *target_end = memchr(target, ' ', (size_t)(line_end - target));
-    if (target_end == NULL) {
-        target_end = line_end;
-    }
-    if (target_end == target) {
+    /* header_len == 0 here means picohttpparser rejected the request line outright (malformed) -
+     * request_head_is_complete only calls this once content_length < 0 has told it apart from a
+     * genuinely incomplete parse (which never reaches this function at all). head->method/path are NULL
+     * in this case, so this must be checked before either is touched. */
+    if (head->header_len == 0) {
         return -1;
     }
 
-    const char *version = skip_spaces(target_end, line_end);
-    const char *version_end = memchr(version, ' ', (size_t)(line_end - version));
-    if (version_end == NULL) {
-        version_end = line_end;
+    /* "33rd header": parse_request_head's own phr_parse_request runs with a larger header-array
+     * capacity (MAX_FRAMING_HEADERS) than the engine stores (MAX_HEADERS) precisely so a request with
+     * more headers than the engine keeps is diagnosed here as malformed, not mis-reported as
+     * "incomplete". Checked before anything else is copied, so a rejected request leaves req exactly as
+     * reset above, same as when phr_parse_request itself used to fail outright on this (its own
+     * capacity was MAX_HEADERS before this split). */
+    if (head->num_headers > MAX_HEADERS) {
+        return -1;
     }
-    copy_bounded(req->version, sizeof(req->version), version, (size_t)(version_end - version));
 
-    const char *qmark = memchr(target, '?', (size_t)(target_end - target));
-    const char *path_end = qmark != NULL ? qmark : target_end;
-    if ((size_t)(path_end - target) >= sizeof(req->path)) {
-        return -2; /* -> 414 URI Too Long: never silently truncate into a different path */
+    if (head->method_len >= sizeof(req->method)) return -1;
+
+    copy_bounded(req->method, sizeof(req->method), head->method, head->method_len);
+    snprintf(req->version, sizeof(req->version), "HTTP/1.%d", head->minor_version);
+
+    const int path_status = request_target_path(head->path, head->path_len, req->path, sizeof(req->path));
+    if (path_status != 0) return path_status;
+
+    const char *qmark = memchr(head->path, '?', head->path_len);
+    if (qmark) {
+        const size_t p_len = (size_t)(qmark - head->path);
+        size_t q_len = head->path_len - p_len - 1;
+        copy_bounded(req->query, sizeof(req->query), qmark + 1, q_len);
     }
-    copy_bounded(req->path, sizeof(req->path), target, (size_t)(path_end - target));
-    url_decode(req->path, req->path, sizeof(req->path), 0);
-    if (qmark != NULL) {
-        copy_bounded(req->query, sizeof(req->query), qmark + 1, (size_t)(target_end - qmark - 1));
+    if (parse_query_string(req->query, req) != 0) {
+        return -4;
     }
-    parse_query_string(req->query, req);
 
-    /* Header block: after the request line's CRLF, up to the blank line. */
-    const char *header_start = line_end + 2;
-    if (header_start > header_end) {
-        header_start = header_end; /* zero header lines: request-line CRLF is the start of "\r\n\r\n" */
-    }
-    const size_t header_block_len = (size_t)(header_end - header_start);
-    parse_headers_n(header_start, header_block_len, req);
-    parse_cookies(req_get_header(req, "Cookie"), req);
-
-    const char *body_start = header_end + 4;
-    const size_t available = raw_len - (size_t)(body_start - raw);
-
-    int has_cl = 0;
-    int chunked = 0;
-    const int cl = scan_framing(header_start, header_block_len, &has_cl, &chunked);
-
-    if (chunked) {
-        if (has_cl) {
-            return -1; /* RFC 7230 3.3.3: ambiguous framing, reject rather than guess */
+    /* store views (pointers into `raw`), not copies - head->num_headers <= MAX_HEADERS is already
+     * guaranteed by the ">MAX_HEADERS" check above, so this can never truncate; the guard is kept only
+     * so this loop stays correct on its own if that invariant ever changes upstream. There is no longer
+     * a per-header size check (the old -3): a view has no fixed capacity to overflow. */
+    size_t host_count = 0;
+    for (size_t i = 0; i < head->num_headers; i++) {
+        const struct phr_header *h = &head->headers[i];
+        if (h->name_len == 4 && strncasecmp(h->name, "Host", 4) == 0) host_count++;
+        if (req->header_count < MAX_HEADERS) {
+            req->headers[req->header_count] = *h;
+            req->header_count++;
         }
+    }
+    /* RFC 9112 §3.2: an HTTP/1.1 request with no Host, or with more than one, MUST get a 400 - two
+     * Hosts let a proxy and the app disagree on which one the request is for (vhost routing, cache
+     * keys). HTTP/1.0 predates the requirement, so it is not enforced there. */
+    if (head->minor_version >= 1 && host_count != 1) {
+        return -1;
+    }
+    /* Cookie splitting is lazy now: req_get_cookie runs parse_cookies itself, once, the first
+     * time a handler actually asks for a cookie by name - most requests that carry a Cookie header
+     * are never asked for one. */
+
+    if (head->content_length < 0) {
+        req->content_length = head->content_length;
+        return -1;
+    }
+    return 0;
+}
+
+int parse_http_request_from_head(const char *raw, const size_t raw_len, const ParsedHead *head,
+                                 Request *req, Arena *arena) {
+    const int fields = parse_request_fields(head, req, arena);
+    if (fields != 0) {
+        return fields;
+    }
+
+    const char *body_start = raw + head->header_len;
+    const size_t available = raw_len - head->header_len;
+
+    if (head->chunked) {
         size_t decoded_len = 0;
-        const int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
+        int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
         if (scan == -2) {
-            req->content_length = -2; /* connection.c maps -2 to 413 for both framings */
+            req->content_length = -2;
             return -1;
         }
-        if (scan != 1) {
-            return -1;
-        }
-        req->body = malloc(decoded_len + 1);
-        if (req->body == NULL) {
-            return -1;
-        }
-        const size_t written = chunked_body_decode(body_start, available, req->body);
+        if (scan != 1) return -1;
+        req->body = arena_alloc(arena, decoded_len + 1);
+        if (!req->body) return -1;
+        size_t written = chunked_body_decode(body_start, available, req->body);
         req->body[written] = '\0';
         req->content_length = (int)written;
         return 0;
     }
 
-    req->content_length = cl;
-    if (cl < 0) {
-        return -1;
-    }
+    req->content_length = head->content_length;
 
-    /* Copy exactly content_length bytes (a pipelined next request may follow in
-     * `raw`). Sized off raw_len, never strlen: the body may hold NUL bytes. */
-    size_t body_len = (size_t)cl;
-    if (body_len > available) {
-        body_len = available;
-    }
-    req->body = malloc(body_len + 1);
-    if (req->body == NULL) {
-        return -1;
-    }
+    size_t body_len = (size_t)head->content_length;
+    if (body_len > available) body_len = available;
+    req->body = arena_alloc(arena, body_len + 1);
+    if (!req->body) return -1;
     memcpy(req->body, body_start, body_len);
     req->body[body_len] = '\0';
     return 0;
 }
 
-void parse_query_string(const char *query, Request *req) {
-    req->query_count = 0;
-    const char *p = query;
-    while (*p != '\0' && req->query_count < MAX_QUERY_PARAMS) {
-        const char *amp = strchr(p, '&');
-        const size_t pair_len = amp != NULL ? (size_t)(amp - p) : strlen(p);
-        if (pair_len > 0) {
-            const char *eq = memchr(p, '=', pair_len);
-            const size_t name_len = eq != NULL ? (size_t)(eq - p) : pair_len;
-            const char *value = eq != NULL ? eq + 1 : p + pair_len;
-            const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
-
-            decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1);
-            decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1);
-            req->query_count++;
-        }
-        if (amp == NULL) {
-            break;
-        }
-        p = amp + 1;
+int parse_http_request_in_place(char *raw, const size_t raw_len, const ParsedHead *head, Request *req,
+                               Arena *arena, char *saved_byte_out) {
+    const int fields = parse_request_fields(head, req, arena);
+    if (fields != 0) {
+        return fields;
     }
+
+    char *body_start = raw + head->header_len;
+    const size_t available = raw_len - head->header_len;
+    size_t body_len;
+    if (head->chunked) {
+        size_t decoded_len = 0;
+        const int scan = chunked_body_scan(body_start, available, MAX_BODY_SIZE, &decoded_len);
+        if (scan == -2) {
+            req->content_length = -2;
+            return -1;
+        }
+        if (scan != 1) return -1;
+        /* decoded output never overtakes the framing being read (each chunk's data moves left by
+         * at least its own size line), so it is written over the raw chunks it came from. */
+        body_len = chunked_body_decode(body_start, available, body_start);
+    } else {
+        body_len = (size_t)head->content_length;
+        if (body_len > available) body_len = available;
+    }
+    /* the NUL goes on the byte just past the body - for Content-Length the first byte of a
+     * pipelined next request, or raw[raw_len] - so hand the original back for the caller to restore. */
+    *saved_byte_out = body_start[body_len];
+    body_start[body_len] = '\0';
+    req->body = body_start;
+    req->content_length = (int)body_len;
+    return 0;
 }
 
-const char *req_get_query(const Request *req, const char *name) {
-    for (int i = 0; i < req->query_count; i++) {
-        if (strcmp(req->query_names[i], name) == 0) {
-            return req->query_values[i];
-        }
+int parse_http_request(const char *raw, const size_t raw_len, Request *req, Arena *arena) {
+    ParsedHead head;
+    parse_request_head(raw, raw_len, &head);
+    if (head.header_len == 0) {
+        reset_request(req, arena);
+        return -1;
     }
-    return NULL;
+    return parse_http_request_from_head(raw, raw_len, &head, req, arena);
 }
 
-static void parse_headers_n(const char *block, const size_t len, Request *req) {
+void parse_headers(const char *header_block, Request *req, Arena *arena) {
+    struct phr_header headers[MAX_HEADERS];
+    size_t num_headers = MAX_HEADERS;
+    int res = phr_parse_headers(header_block, strlen(header_block), headers, &num_headers, 0);
+    if (res == -1) return;
+
     req->header_count = 0;
-    const char *p = block;
-    const char *end = block + len;
-
-    while (p < end && req->header_count < MAX_HEADERS) {
-        const char *le = find_line_end(p, end);
-        const char *colon = memchr(p, ':', (size_t)(le - p));
-        if (colon != NULL) {
-            const char *value = colon + 1;
-            while (value < le && is_ows(*value)) {
-                value++;
-            }
-            const char *value_end = le;
-            while (value_end > value && is_ows(value_end[-1])) {
-                value_end--;
-            }
-            copy_bounded(req->header_names[req->header_count], sizeof(req->header_names[0]), p,
-                         (size_t)(colon - p));
-            copy_bounded(req->header_values[req->header_count], sizeof(req->header_values[0]), value,
-                         (size_t)(value_end - value));
+    req->arena = arena;
+    for (size_t i = 0; i < num_headers; i++) {
+        if (req->header_count < MAX_HEADERS) {
+            req->headers[req->header_count] = headers[i];
             req->header_count++;
         }
-        /* A line with no ':' is malformed and skipped. */
-        if (le >= end) {
-            break;
-        }
-        p = le + 2;
     }
 }
 
-void parse_headers(const char *header_block, Request *req) {
-    parse_headers_n(header_block, strlen(header_block), req);
-}
 
 const char *req_get_header(const Request *req, const char *name) {
+    if (req->arena == NULL) {
+        return NULL;
+    }
+    const size_t name_len = strlen(name);
     for (int i = 0; i < req->header_count; i++) {
-        if (strcasecmp(req->header_names[i], name) == 0) {
-            return req->header_values[i];
+        if (req->headers[i].name_len == name_len &&
+            strncasecmp(req->headers[i].name, name, name_len) == 0) {
+            /* Materialize a NUL-terminated copy of the view every call - not cached. A handler reads a
+             * given header at most a handful of times per request, so re-copying a few dozen bytes from
+             * the arena each time costs less than a cache field (and its invalidation rules) would. */
+            char *value = arena_alloc(req->arena, req->headers[i].value_len + 1);
+            if (value == NULL) {
+                return NULL;
+            }
+            memcpy(value, req->headers[i].value, req->headers[i].value_len);
+            value[req->headers[i].value_len] = '\0';
+            return value;
         }
     }
     return NULL;
@@ -496,6 +770,17 @@ void parse_cookies(const char *cookie_header, Request *req) {
 }
 
 const char *req_get_cookie(const Request *req, const char *name) {
+    if (!req->cookies_parsed) {
+        /* split the Cookie header on first access instead of on every parsed request - a mutable-
+         * through-const-pointer cache, the same idiom req->arena-backed materialization above relies on
+         * implicitly: req is never actually const-qualified at its point of definition (a stack local in
+         * handle_readable, or a test's own Request), only the parameter type here is, so writing through
+         * a cast-away-const pointer to it is well-defined C, not the "modifying a truly const object" UB
+         * case. */
+        Request *mutable_req = (Request *)req;
+        parse_cookies(req_get_header(req, "Cookie"), mutable_req);
+        mutable_req->cookies_parsed = 1;
+    }
     for (int i = 0; i < req->cookie_count; i++) {
         if (strcmp(req->cookie_names[i], name) == 0) {
             return req->cookie_values[i];
@@ -538,6 +823,7 @@ const char *status_text(const int status) {
     }
 }
 
+
 /* ---- chunked request bodies ---- */
 
 /* Pointer to the "\r" of the first CRLF in buf[0..len), or NULL. Length-bounded:
@@ -553,16 +839,85 @@ static const char *find_crlf(const char *buf, const size_t len) {
 
 /* "\r\n\r\n" ending a chunked body's trailer-part; found from the last-chunk line's own start. */
 static const char *find_double_crlf(const char *buf, const size_t len) {
-    return find_header_end(buf, len);
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+/* A chunk-size line without its CRLF (RFC 9112 7.1): 1*HEXDIG, then either nothing or BWS ";" chunk-ext.
+ * Hand-rolled, not strtoul: strtoul also takes leading whitespace, a sign and a "0x" prefix, so " 5",
+ * "+5" and "0x5" were read as sizes that a front-end proxy may read differently ("0x5" as 0) - the
+ * disagreement request smuggling needs. At most 2*sizeof(size_t) digits (leading zeros included), so
+ * the value cannot overflow. The extension is ignored, but it may not hold a control character other
+ * than HTAB (a CR or LF in it would already have ended the line). 0 ok, -1 malformed. */
+static int parse_chunk_size_line(const char *line, const size_t len, size_t *size_out) {
+    size_t i = 0;
+    size_t size = 0;
+    while (i < len && hex_value(line[i]) >= 0) {
+        if (i == 2 * sizeof(size_t)) {
+            return -1;
+        }
+        size = (size << 4) | (size_t)hex_value(line[i]);
+        i++;
+    }
+    if (i == 0) {
+        return -1;
+    }
+    while (i < len && is_ows(line[i])) {
+        i++;
+    }
+    if (i < len) {
+        if (line[i] != ';') {
+            return -1; /* also a lone trailing BWS: BWS is only allowed before ";" */
+        }
+        for (i++; i < len; i++) {
+            const unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return -1;
+            }
+        }
+    } else if (is_ows(line[len - 1])) {
+        return -1;
+    }
+    *size_out = size;
+    return 0;
+}
+
+/* The trailer-part's field lines, each with its CRLF (the terminating blank line excluded). Held to the
+ * same rules as the header block: every LF ends a CRLF, no bare CR, no control character but HTAB -
+ * the trailer is discarded, but a proxy that reads a bare LF as a line end would frame it differently. */
+static int trailer_is_clean(const char *p, const size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)p[i];
+        if (c == '\r') {
+            if (i + 1 >= len || p[i + 1] != '\n') {
+                return 0;
+            }
+            i++;
+        } else if ((c < 0x20 && c != '\t') || c == 0x7f) {
+            return 0; /* includes a bare LF */
+        }
+    }
+    return 1;
 }
 
 int chunked_body_scan(const char *body_start, const size_t available, const size_t max_decoded_len,
                       size_t *decoded_len_out) {
-    size_t pos = 0;
-    size_t decoded_len = 0;
+    ChunkScanState state = {0};
+    return chunked_body_scan_resume(body_start, available, max_decoded_len, &state, decoded_len_out);
+}
 
+int chunked_body_scan_resume(const char *body_start, const size_t available, const size_t max_decoded_len,
+                             ChunkScanState *state, size_t *decoded_len_out) {
+    /* state->pos only ever moves past chunks that were fully received and validated, so every
+     * return below leaves it at the start of a size line that has to be looked at again next time
+     * (at most MAX_CHUNK_SIZE_LINE_LEN bytes re-read, never the body before it). */
     for (;;) {
-        *decoded_len_out = decoded_len;
+        const size_t pos = state->pos;
+        *decoded_len_out = state->decoded_len;
         if (pos >= available) {
             return 0;
         }
@@ -579,45 +934,52 @@ int chunked_body_scan(const char *body_start, const size_t available, const size
             return -1;
         }
 
-        /* "<hex-size>[;ext]": extensions are accepted and ignored. */
-        char size_buf[MAX_CHUNK_SIZE_LINE_LEN + 1];
-        memcpy(size_buf, line_start, line_len);
-        size_buf[line_len] = '\0';
-        char *ext = strchr(size_buf, ';');
-        if (ext != NULL) {
-            *ext = '\0';
-        }
-        if (size_buf[0] == '\0') {
+        /* "<hex-size>[BWS;ext]": extensions are accepted and ignored. */
+        size_t chunk_size;
+        if (parse_chunk_size_line(line_start, line_len, &chunk_size) != 0) {
             return -1;
         }
 
-        char *endptr;
-        const unsigned long chunk_size = strtoul(size_buf, &endptr, 16);
-        if (*endptr != '\0') {
-            return -1; /* non-hex characters in the size */
-        }
-
         if (chunk_size == 0) {
-            /* Last chunk: complete once the trailer-part's terminating blank line is here. */
-            return find_double_crlf(line_start, available - pos) != NULL ? 1 : 0;
+            /* Last chunk: complete once the trailer-part's terminating blank line is here. The search
+             * resumes where the previous one gave up (minus 3 bytes, so a "\r\n\r\n" split across
+             * reads is still found) - a slow-dripped trailer is scanned once, not once per recv. */
+            const size_t from = state->trailer_from > pos ? state->trailer_from : pos;
+            const char *end = find_double_crlf(body_start + from, available - from);
+            if (end != NULL) {
+                /* trailer lines run from after the last-chunk line to end's CRLF; none when end is that
+                 * line's own CRLF (end - body_start == pos + line_len) */
+                const size_t trailer_start = pos + line_len + 2;
+                const size_t trailer_end = (size_t)(end - body_start) + 2;
+                if (trailer_end > trailer_start &&
+                    !trailer_is_clean(body_start + trailer_start, trailer_end - trailer_start)) {
+                    return -1;
+                }
+                state->body_end = (size_t)(end - body_start) + 4; /* next pipelined request starts here */
+                return 1;
+            }
+            if (available - from > 3) {
+                state->trailer_from = available - 3;
+            }
+            return 0;
         }
 
         /* Checked against the *declared* size before its data arrives; decoded_len
          * never exceeds max_decoded_len, so the subtraction cannot underflow. */
-        if (chunk_size > max_decoded_len - decoded_len) {
+        if (chunk_size > max_decoded_len - state->decoded_len) {
             return -2;
         }
 
-        pos += line_len + 2;
-        if (pos + chunk_size + 2 > available) {
+        const size_t data_pos = pos + line_len + 2;
+        if (data_pos + chunk_size + 2 > available) {
             return 0; /* this chunk's data / trailing CRLF has not fully arrived */
         }
-        if (body_start[pos + chunk_size] != '\r' || body_start[pos + chunk_size + 1] != '\n') {
+        if (body_start[data_pos + chunk_size] != '\r' || body_start[data_pos + chunk_size + 1] != '\n') {
             return -1; /* size does not match data: every later boundary would desync */
         }
 
-        decoded_len += chunk_size;
-        pos += chunk_size + 2;
+        state->decoded_len += chunk_size;
+        state->pos = data_pos + chunk_size + 2;
     }
 }
 
@@ -630,24 +992,115 @@ size_t chunked_body_decode(const char *body_start, const size_t available, char 
         const char *line_end = find_crlf(line_start, available - pos);
         const size_t line_len = (size_t)(line_end - line_start);
 
-        char size_buf[MAX_CHUNK_SIZE_LINE_LEN + 1];
-        memcpy(size_buf, line_start, line_len);
-        size_buf[line_len] = '\0';
-        char *ext = strchr(size_buf, ';');
-        if (ext != NULL) {
-            *ext = '\0';
-        }
-        const unsigned long chunk_size = strtoul(size_buf, NULL, 16);
+        size_t chunk_size = 0;
+        parse_chunk_size_line(line_start, line_len, &chunk_size); /* the prior scan validated every line */
 
         pos += line_len + 2;
         if (chunk_size == 0) {
             break; /* trailer header lines, if any, are discarded */
         }
 
-        memcpy(out + out_len, body_start + pos, chunk_size);
+        memmove(out + out_len, body_start + pos, chunk_size); /* out may be body_start (in place) */
         out_len += chunk_size;
         pos += chunk_size + 2;
     }
 
     return out_len;
+}
+int parse_query_string(const char *query, Request *req) {
+    req->query_count = 0;
+    const char *p = query;
+    while (*p != '\0' && req->query_count < MAX_QUERY_PARAMS) {
+        const char *amp = strchr(p, '&');
+        const size_t pair_len = amp != NULL ? (size_t)(amp - p) : strlen(p);
+        if (pair_len > 0) {
+            const char *eq = memchr(p, '=', pair_len);
+            const size_t name_len = eq != NULL ? (size_t)(eq - p) : pair_len;
+            const char *value = eq != NULL ? eq + 1 : p + pair_len;
+            const size_t value_len = eq != NULL ? pair_len - name_len - 1 : 0;
+
+            const int name_ok = decode_bounded(req->query_names[req->query_count], sizeof(req->query_names[0]), p, name_len, 1) != -1;
+            const int value_ok = decode_bounded(req->query_values[req->query_count], sizeof(req->query_values[0]), value, value_len, 1) != -1;
+            req->query_count++;
+            if (!name_ok || !value_ok) {
+                /* a %00 (or a raw NUL byte) decoded into this pair - reject the whole request (400)
+                 * rather than let req_get_query silently hand back a truncated name or value. */
+                return -1;
+            }
+        }
+        if (amp == NULL) {
+            break;
+        }
+        p = amp + 1;
+    }
+    return 0;
+}
+
+const char *req_get_query(const Request *req, const char *name) {
+    for (int i = 0; i < req->query_count; i++) {
+        if (strcmp(req->query_names[i], name) == 0) {
+            return req->query_values[i];
+        }
+    }
+    return NULL;
+}
+
+/* Days since 1970-01-01 -> proleptic Gregorian y/m/d (Howard Hinnant's civil_from_days, era-based, exact). */
+static void civil_from_days(long long days, int *year, int *month, int *day) {
+    days += 719468;
+    const long long era = days / 146097;               /* days >= 0 here: the caller clamps t to >= 0 */
+    const long long doe = days - era * 146097;          /* [0, 146096] */
+    const long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const long long mp = (5 * doy + 2) / 153;
+    *day = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *month = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *year = (int)(yoe + era * 400 + (*month <= 2));
+}
+
+static void put_2digits(char *out, int v) {
+    out[0] = (char)('0' + v / 10);
+    out[1] = (char)('0' + v % 10);
+}
+
+void format_http_date(time_t t, char out[HTTP_DATE_LEN + 1]) {
+    static const char weekdays[7][4] = { "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" }; /* 1970-01-01 was a Thursday */
+    static const char months[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const long long secs = t < 0 ? 0 : (long long)t;
+    const long long days = secs / 86400;
+    const int sod = (int)(secs % 86400);
+    int year, month, day;
+    civil_from_days(days, &year, &month, &day);
+    if (year > 9999) {
+        year = 9999; /* the fixed width has four year digits */
+    }
+
+    memcpy(out, weekdays[days % 7], 3);
+    out[3] = ',';
+    out[4] = ' ';
+    put_2digits(out + 5, day);
+    out[7] = ' ';
+    memcpy(out + 8, months[month - 1], 3);
+    out[11] = ' ';
+    put_2digits(out + 12, year / 100);
+    put_2digits(out + 14, year % 100);
+    out[16] = ' ';
+    put_2digits(out + 17, sod / 3600);
+    out[19] = ':';
+    put_2digits(out + 20, sod / 60 % 60);
+    out[22] = ':';
+    put_2digits(out + 23, sod % 60);
+    memcpy(out + 25, " GMT", 4);
+    out[HTTP_DATE_LEN] = '\0';
+}
+
+const char *http_date_for(const time_t now) {
+    static char cached[HTTP_DATE_LEN + 1];
+    static time_t cached_second = (time_t)-1;
+    if (now != cached_second) {
+        format_http_date(now, cached);
+        cached_second = now;
+    }
+    return cached;
 }

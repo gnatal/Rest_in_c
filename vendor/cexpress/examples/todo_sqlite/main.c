@@ -1,0 +1,103 @@
+#include "cexpress.h"
+#include "handlers.h"
+#include "middlewares.h"
+#include "db.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void handler_ping(const Request *req, Response *res) {
+    (void)req;
+    res_send(res, "pong");
+}
+
+int main(void) {
+  App app;
+  app_init(&app);
+
+  const char *port_env = getenv("PORT");
+  if (port_env != NULL) {
+    int parsed_port = atoi(port_env);
+    if (parsed_port > 0 && parsed_port <= 65535) {
+      app.config.port = parsed_port;
+    }
+  }
+
+  /* getenv's string lives for the whole process, so it outlives app_listen as bind_address requires. */
+  const char *bind_env = getenv("BIND_ADDRESS");
+  if (bind_env != NULL && bind_env[0] != '\0') {
+    app.config.bind_address = bind_env;
+  }
+
+  const char *workers_env = getenv("WORKERS");
+  if (workers_env != NULL) {
+    if (strcmp(workers_env, "auto") == 0) {
+      app.config.workers = 0; /* 0 triggers auto-detection of CPU cores */
+    } else {
+      int parsed_workers = atoi(workers_env);
+      if (parsed_workers >= 0) {
+        app.config.workers = parsed_workers;
+      }
+    }
+  }
+
+  const char *api_key_env = getenv("API_KEY");
+  if (api_key_env != NULL && api_key_env[0] != '\0') {
+    mw_authenticate_set_key(api_key_env);
+  }
+
+  /* SQLite-backed Todo storage: db_open validates TODO_DB_PATH and runs the
+   * schema migration once, in this (pre-fork) process, then closes again -
+   * app_on_worker_start registers db_worker_init to open this app's actual,
+   * per-process connection later, always after any cluster fork has
+   * happened. See lib/CLAUDE.md ("Behavior reference, Workers and fork") and
+   * examples/todo_sqlite/CLAUDE.md for why this two-step dance is necessary. */
+  const char *db_path_env = getenv("TODO_DB_PATH");
+  const char *db_path = (db_path_env != NULL && db_path_env[0] != '\0') ? db_path_env : "todos.db";
+  if (db_open(db_path) != 0) {
+    fprintf(stderr, "Failed to initialize database at '%s'\n", db_path);
+    return 1;
+  }
+  db_close();
+  app_on_worker_start(&app, db_worker_init);
+
+  const char *quiet_env = getenv("QUIET");
+  if (quiet_env == NULL || strcmp(quiet_env, "1") != 0) {
+    app_use(&app, mw_logger);
+  }
+  app_use(&app, mw_body_size_guard);
+  app_use_error(&app, error_handler_json);
+
+  /* Todo UI: a single self-contained static page, served directly (not
+   * through the /static mount below) via res_send_file. */
+  app_get(&app, "/", handler_home);
+
+  /* Connection stress-test target: no database, no JSON (see scripts/stress_test.sh). */
+  app_get(&app, "/ping", handler_ping);
+
+  /* Generic static-file-serving demo (lib/router.h: app_serve_static),
+   * unrelated to the Todo UI above - serves whatever's in public/
+   * (e.g. GET /static/style.css). */
+  app_serve_static(&app, "/static", "public");
+
+  /* Todo REST API, mounted under /api/todos via a Router (app_mount) - the
+   * C analogue of Express's app.use('/api/todos', router). Reads (GET) are
+   * public; writes each attach mw_authenticate as per-route middleware, so
+   * a per-route middleware list and a mounted sub-router compose together -
+   * unlike router_use, this doesn't gate the GETs on the same router. */
+  Router todo_router;
+  router_init(&todo_router);
+  router_get(&todo_router, "/", handler_list_todos);
+  router_get(&todo_router, "/:id", handler_get_todo);
+  router_post_mw(&todo_router, "/", handler_create_todo, (Middleware[]){mw_authenticate}, 1);
+  router_put_mw(&todo_router, "/:id", handler_replace_todo, (Middleware[]){mw_authenticate}, 1);
+  router_patch_mw(&todo_router, "/:id", handler_patch_todo, (Middleware[]){mw_authenticate}, 1);
+  router_delete_mw(&todo_router, "/:id", handler_delete_todo, (Middleware[]){mw_authenticate}, 1);
+  app_mount(&app, "/api/todos", &todo_router);
+
+  app_listen(&app, app.config.port);
+  db_close();
+  app_destroy(&app);
+
+  return 0;
+}

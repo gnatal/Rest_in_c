@@ -54,6 +54,14 @@ int event_loop_init(App *app) {
     return 0;
 }
 
+const char *event_loop_backend_name(const App *app) {
+    return event_loop_is_open(app) ? "kqueue" : "none";
+}
+
+int event_loop_is_open(const App *app) {
+    return app != NULL && app->kq >= 0;
+}
+
 void event_loop_close(App *app) {
     if (app == NULL) {
         return;
@@ -139,7 +147,7 @@ int event_loop_unwatch_write(App *app, int fd, void *udata) {
     return unwatch(app, fd, EVFILT_WRITE, EVENT_WRITE);
 }
 
-int event_loop_unwatch_all(App *app, int fd) {
+int event_loop_release_fd(App *app, int fd) {
     if (app == NULL || app->kq < 0 || fd < 0) {
         return -1;
     }
@@ -147,14 +155,8 @@ int event_loop_unwatch_all(App *app, int fd) {
     if (conn != NULL) {
         conn->events_watched = 0;
     }
-    struct kevent changes[2];
-    EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    const int rc = kevent(app->kq, changes, 2, NULL, 0, NULL);
-    if (rc < 0 && (errno == ENOENT || errno == EBADF)) {
-        return 0;
-    }
-    return rc;
+    /* No EV_DELETE: the caller closes fd next, and close() drops every knote on it. */
+    return 0;
 }
 
 int event_loop_arm_shutdown_timer(App *app) {

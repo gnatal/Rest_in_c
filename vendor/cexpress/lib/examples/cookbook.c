@@ -5,24 +5,30 @@
  *     static void name(const Request *req, Response *res);
  *
  * and must produce exactly one response with res_send / res_json / res_send_bytes / res_redirect /
- * res_send_file (or res_write ... res_end). Handlers are terminal: they cannot call chain_next or
+ * res_send_file (or res_write ... res_end, or res_stream for large/endless bodies - recipe 14). Handlers are terminal: they cannot call chain_next or
  * chain_error (only Middleware can). A second res_send in the same request replaces the first.
  *
  * DON'T (each of these is a real bug pattern, see lib/CLAUDE.md "Ownership"):
  *  1. free() or keep anything reached through `req`: it dies when the handler returns. That covers
- *     req->body and every pointer from req_get_param / req_get_query / req_get_header / req_get_cookie.
+ *     req->body (a view into the connection's input buffer) and every pointer from req_get_param / req_get_query /
+ *     req_get_header / req_get_cookie.
  *  2. strlen(req->body) for binary bodies: use req->content_length (bodies may hold NUL bytes).
- *  3. json_free() a parsed tree before you have finished using strings borrowed from it
- *     (json_as_string returns a pointer INTO the tree).
- *  4. use jw_data() after jw_free(); or forget jw_free() on the error path.
+ *  3. keep a string borrowed from a parsed yyjson document (yyjson_get_str) or anything from arena_alloc past the
+ *     request: it lives in the connection arena, which is reset when the response has been written. Copy what you
+ *     need to keep.
+ *  4. forget free() on the string that yyjson_mut_write returns, or use it after free(): it is allocated by libc
+ *     even when the document itself uses the arena. (The document needs no free with the arena allocator.)
  *  5. call chain_next() from a handler, or in a middleware call it more than once or after responding.
  *  6. open a database/socket in main() and then fork workers: open it in an app_on_worker_start hook.
- *  7. build JSON with snprintf("%s"): the text is not escaped. Use JsonWriter.
+ *  7. build JSON with snprintf("%s"): the text is not escaped. Use yyjson.
+ *  8. register two routes that name the same path position differently ("/orders/:id/items" and "/orders/:oid/notes"):
+ *     both capture under the first name. Use one name per position.
  *
- * Limits (excess is truncated or dropped, never overflowed): 32 routes, 16 app middlewares,
- * 8 per-route middlewares, 8 path params (value 63 chars), 16 query params (name/value 63 chars),
- * 32 request headers (value 255 chars), 16 cookies (value 255 chars), 16 response headers,
- * 16 Set-Cookie lines, request body 10 MiB, request headers 8 KiB.
+ * Limits (excess is truncated or dropped, never overflowed; a 33rd request header is rejected with 400;
+ * a header name over 63 chars or value over 1023 chars is rejected with 431, not truncated):
+ * no cap on routes per app (64 per Router), 16 app middlewares, 8 per-route middlewares, 8 path params (value 63 chars),
+ * 16 query params (name/value 63 chars), 32 request headers (value up to 1023 chars), 16 cookies (value 255 chars),
+ * 16 response headers, 16 Set-Cookie lines, request body 10 MiB, request headers 8 KiB.
  */
 
 #include <errno.h>
@@ -35,29 +41,31 @@
 
 /* ---------------------------------------------------------------------------------------------
  * RECIPE 0 - JSON reply helper. Used by most recipes below.
- * Finishes a JsonWriter into a response: 500 if the writer failed, otherwise `status` + body.
- * Always frees the writer.
+ * Serializes a yyjson document into a response: 500 if serialization failed, otherwise `status` + body.
+ * Always frees the serialized string (libc-malloc'd) and the document (a no-op for an arena document).
  * ------------------------------------------------------------------------------------------- */
-static void send_json(Response *res, const int status, JsonWriter *w) {
-    if (!jw_ok(w)) {
+static void send_json(Response *res, const int status, yyjson_mut_doc *doc) {
+    size_t len;
+    char *json = yyjson_mut_write(doc, 0, &len);
+    if (json) {
+        res_status(res, status);
+        res_json(res, json);
+        free(json);
+    } else {
         res_status(res, 500);
         res_json(res, "{\"error\":\"json encoding failed\"}");
-    } else {
-        res_status(res, status);
-        res_json(res, jw_data(w));
     }
-    jw_free(w);
+    yyjson_mut_doc_free(doc);
 }
 
 /* Sends {"error": message} with `status`. */
 static void send_error(Response *res, const int status, const char *message) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "error");
-    jw_string(&w, message);
-    jw_object_end(&w);
-    send_json(res, status, &w);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "error", message);
+    send_json(res, status, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -81,13 +89,13 @@ static void recipe_square(const Request *req, Response *res) {
         send_error(res, 400, "n must be an integer between -1000000 and 1000000");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "n");      jw_int(&w, n);
-    jw_key(&w, "square"); jw_int(&w, n * n);
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_int(doc, obj, "n", n);
+    yyjson_mut_obj_add_int(doc, obj, "square", n * n);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -115,28 +123,28 @@ static void recipe_create_note(const Request *req, Response *res) {
         return;
     }
 
-    char err[128];
-    JsonValue *body = json_parse(req->body, err, sizeof(err)); /* req->body is NUL-terminated */
-    if (body == NULL) {
-        send_error(res, 400, err);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
+    if (doc == NULL) {
+        send_error(res, 400, "invalid json");
         return;
     }
+    yyjson_val *body = yyjson_doc_get_root(doc);
 
-    const char *title = json_as_string(json_object_get(body, "title"), NULL);
+    const char *title = yyjson_get_str(yyjson_obj_get(body, "title"));
     if (title == NULL || title[0] == '\0' || strlen(title) > 255) {
-        json_free(body);
+        yyjson_doc_free(doc);
         send_error(res, 400, "title is required (1-255 characters)");
         return;
     }
 
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "id");    jw_int(&w, 1);
-    jw_key(&w, "title"); jw_string(&w, title);
-    jw_object_end(&w);
-    json_free(body); /* safe now: the writer copied the title */
-    send_json(res, 201, &w);
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *obj = yyjson_mut_obj(mdoc);
+    yyjson_mut_doc_set_root(mdoc, obj);
+    yyjson_mut_obj_add_int(mdoc, obj, "id", 1);
+    yyjson_mut_obj_add_str(mdoc, obj, "title", title);
+    send_json(res, 201, mdoc);
+    yyjson_doc_free(doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -150,17 +158,17 @@ static void recipe_numbers(const Request *req, Response *res) {
         send_error(res, 400, "count must be between 0 and 100");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_array_begin(&w);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, arr);
     for (long i = 0; i < count; i++) {
-        jw_object_begin(&w);
-        jw_key(&w, "i");    jw_int(&w, i);
-        jw_key(&w, "even"); jw_bool(&w, i % 2 == 0);
-        jw_object_end(&w);
+        yyjson_mut_val *obj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, obj, "i", i);
+        yyjson_mut_obj_add_bool(doc, obj, "even", i % 2 == 0);
+        yyjson_mut_arr_append(arr, obj);
     }
-    jw_array_end(&w);
-    send_json(res, 200, &w);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -224,13 +232,12 @@ static void recipe_list_notes(const Request *req, Response *res) {
 }
 
 static void recipe_get_note(const Request *req, Response *res) {
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "id");
-    jw_string(&w, req_get_param(req, "id"));
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_str(doc, obj, "id", req_get_param(req, "id"));
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -269,6 +276,7 @@ static void recipe_logout(const Request *req, Response *res) {
  * RECIPE 9 - HTML form (application/x-www-form-urlencoded).
  *   POST /form  body: name=Ada+L&age=36  ->  "Hello, Ada L (36)"
  * The parser copies and decodes into the form struct; req->body is untouched.
+ * It returns < 0 for a %00 or a field too long for its slot: answer 400, never use the form.
  * ------------------------------------------------------------------------------------------- */
 static void recipe_form(const Request *req, Response *res) {
     const char *content_type = req_get_header(req, "Content-Type");
@@ -278,7 +286,11 @@ static void recipe_form(const Request *req, Response *res) {
         return;
     }
     UrlEncodedForm form;
-    parse_urlencoded_body(req->body, (size_t)req->content_length, &form);
+    if (parse_urlencoded_body(req->body, (size_t)req->content_length, &form) < 0) {
+        res_status(res, 400);
+        res_send(res, "malformed form field");
+        return;
+    }
     const char *name = urlencoded_get_field(&form, "name");
     const char *age = urlencoded_get_field(&form, "age");
     if (name == NULL || name[0] == '\0') {
@@ -295,6 +307,7 @@ static void recipe_form(const Request *req, Response *res) {
  * RECIPE 10 - file upload (multipart/form-data).
  *   POST /upload  part "file" (filename=a.txt) -> {"filename":"a.txt","bytes":5}
  * Part data points INTO req->body, is NOT NUL-terminated, and may hold NUL bytes: use data_len.
+ * file->filename is the client's raw string ("../../x" included): multipart_safe_filename first.
  * ------------------------------------------------------------------------------------------- */
 static void recipe_upload(const Request *req, Response *res) {
     char boundary[MAX_BOUNDARY_LEN];
@@ -305,17 +318,18 @@ static void recipe_upload(const Request *req, Response *res) {
     MultipartForm form;
     parse_multipart_body(req->body, (size_t)req->content_length, boundary, &form);
     const MultipartPart *file = multipart_get_part(&form, "file");
-    if (file == NULL || file->filename[0] == '\0') {
+    char filename[sizeof(file->filename)];
+    if (file == NULL || !multipart_safe_filename(file, filename, sizeof(filename))) {
         send_error(res, 400, "missing file part");
         return;
     }
-    JsonWriter w;
-    jw_init(&w);
-    jw_object_begin(&w);
-    jw_key(&w, "filename"); jw_string(&w, file->filename);
-    jw_key(&w, "bytes");    jw_int(&w, (long long)file->data_len);
-    jw_object_end(&w);
-    send_json(res, 200, &w);
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, obj);
+    yyjson_mut_obj_add_strcpy(doc, obj, "filename", filename); /* strcpy: filename is a stack buffer */
+    yyjson_mut_obj_add_int(doc, obj, "bytes", (long long)file->data_len);
+    send_json(res, 200, doc);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -369,11 +383,135 @@ static void recipe_stream(const Request *req, Response *res) {
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * RECIPE 14 - large or endless responses with res_stream: generated downloads, server-sent events.
+ * res_write (recipe 12) buffers the whole body until the handler returns (at most MAX_BODY_SIZE).
+ * res_stream instead hands the engine a producer that the event loop calls each time the previous
+ * output has reached the socket, so a connection never holds more than STREAM_CHUNK_SIZE of it.
+ * The producer runs AFTER the handler has returned: keep everything it needs in a malloc'd ctx (never
+ * req, res or arena memory) and give res_stream the free function; the engine calls it exactly once.
+ * Return STREAM_MORE (call me again), STREAM_PAUSE (nothing now: wait for app_wake_streams or the
+ * ~1 s sweep), STREAM_END, or STREAM_ABORT (closes, the client sees a truncated body).
+ *   GET /export?rows=3 -> CSV "id,square\n0,0\n1,1\n2,4\n", generated a turn at a time
+ *   GET /events        -> text/event-stream; POST /events (body = message) publishes to every subscriber
+ * ------------------------------------------------------------------------------------------- */
+typedef struct {
+    int header_written;
+    long next_row;
+    long rows;
+} ExportCtx;
+
+static int export_producer(StreamWriter *out, void *ctx_ptr) {
+    ExportCtx *ctx = ctx_ptr;
+    if (!ctx->header_written) {
+        if (stream_write(out, "id,square\n", 10) != 0) {
+            return STREAM_MORE;
+        }
+        ctx->header_written = 1;
+    }
+    while (ctx->next_row < ctx->rows) {
+        char line[64];
+        const int n = snprintf(line, sizeof(line), "%ld,%ld\n", ctx->next_row, ctx->next_row * ctx->next_row);
+        if (stream_write(out, line, (size_t)n) != 0) {
+            return STREAM_MORE; /* this turn's buffer is full: the same row is written next call */
+        }
+        ctx->next_row++;
+    }
+    return STREAM_END;
+}
+
+static void recipe_export(const Request *req, Response *res) {
+    const char *rows_text = req_get_query(req, "rows");
+    char *end = NULL;
+    const long rows = rows_text != NULL ? strtol(rows_text, &end, 10) : 1000;
+    if (rows_text != NULL && (end == rows_text || *end != '\0' || rows < 0 || rows > 10000000)) {
+        res_status(res, 400);
+        res_send(res, "rows must be 0..10000000");
+        return;
+    }
+    ExportCtx *ctx = malloc(sizeof(*ctx)); /* freed by the engine through the free() passed below */
+    if (ctx == NULL) {
+        res_status(res, 500);
+        res_send(res, "out of memory");
+        return;
+    }
+    ctx->header_written = 0;
+    ctx->next_row = 0;
+    ctx->rows = rows;
+    res_set_header(res, "Content-Type", "text/csv");
+    res_set_header(res, "Content-Disposition", "attachment; filename=\"squares.csv\"");
+    if (res_stream(res, export_producer, ctx, free) != 0) {
+        free(ctx); /* -1: nothing was taken, the ctx is still ours */
+    }
+}
+
+/* Server-sent events: a per-worker message log (workers share nothing: publish in a cluster reaches
+ * only the worker that received the POST), each subscriber's ctx remembers how far it has read. */
+#define EVENT_LOG_SIZE 16
+static char g_event_log[EVENT_LOG_SIZE][128];
+static long g_event_count;   /* total ever published; the log keeps the last EVENT_LOG_SIZE */
+static App *g_cookbook_app;  /* for app_wake_streams from a handler */
+
+typedef struct {
+    long next_event;
+} SubscriberCtx;
+
+static int events_producer(StreamWriter *out, void *ctx_ptr) {
+    SubscriberCtx *ctx = ctx_ptr;
+    if (g_event_count - ctx->next_event > EVENT_LOG_SIZE) {
+        ctx->next_event = g_event_count - EVENT_LOG_SIZE; /* fell behind: skip what the log dropped */
+    }
+    while (ctx->next_event < g_event_count) {
+        char frame[160];
+        const int n = snprintf(frame, sizeof(frame), "data: %s\n\n", g_event_log[ctx->next_event % EVENT_LOG_SIZE]);
+        if (stream_write(out, frame, (size_t)n) != 0) {
+            return STREAM_MORE;
+        }
+        ctx->next_event++;
+    }
+    return STREAM_PAUSE; /* woken by app_wake_streams (publish) or the ~1 s sweep */
+}
+
+static void recipe_events_subscribe(const Request *req, Response *res) {
+    (void)req;
+    SubscriberCtx *ctx = malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        res_status(res, 500);
+        res_send(res, "out of memory");
+        return;
+    }
+    ctx->next_event = g_event_count > EVENT_LOG_SIZE ? g_event_count - EVENT_LOG_SIZE : 0; /* replay the log */
+    res_set_header(res, "Content-Type", "text/event-stream");
+    res_set_header(res, "Cache-Control", "no-cache");
+    if (res_stream(res, events_producer, ctx, free) != 0) {
+        free(ctx);
+    }
+}
+
+static void recipe_events_publish(const Request *req, Response *res) {
+    /* One SSE "data:" line: refuse line breaks rather than let a message forge extra events. */
+    if (req->content_length == 0 || req->content_length >= (int)sizeof(g_event_log[0]) ||
+        memchr(req->body, '\n', (size_t)req->content_length) != NULL ||
+        memchr(req->body, '\r', (size_t)req->content_length) != NULL ||
+        memchr(req->body, '\0', (size_t)req->content_length) != NULL) {
+        res_status(res, 400);
+        res_send(res, "message must be 1..127 bytes on one line");
+        return;
+    }
+    char *slot = g_event_log[g_event_count % EVENT_LOG_SIZE];
+    memcpy(slot, req->body, (size_t)req->content_length);
+    slot[req->content_length] = '\0';
+    g_event_count++;
+    app_wake_streams(g_cookbook_app); /* subscribers run on their next write turn, not inside this call */
+    res_status(res, 204);
+    res_send(res, "");
+}
+
+/* ---------------------------------------------------------------------------------------------
  * RECIPE 13 - per-worker resource (database, cache, anything with OS-level state).
  * fork() copies main()'s memory into every cluster worker, so never open such a resource before
  * app_listen. Validate and migrate in main(), close it, and open the real one in a hook:
  * the hook runs once in each serving process, after any fork.
- *   app/db.c (db_open / db_worker_init) is the full SQLite version of this pattern.
+ *   examples/todo_sqlite/db.c (db_open / db_worker_init) is the full SQLite version of this pattern.
  * ------------------------------------------------------------------------------------------- */
 static int g_worker_resource_opened;
 static void open_resource_for_this_process(void) {
@@ -416,6 +554,10 @@ void cookbook_register(App *app) {
     app_delete(app, "/things/:id", recipe_delete_thing);
     app_post(app, "/things", recipe_created);
     app_get(app, "/stream", recipe_stream);
+    g_cookbook_app = app;
+    app_get(app, "/export", recipe_export);
+    app_get(app, "/events", recipe_events_subscribe);
+    app_post(app, "/events", recipe_events_publish);
 }
 
 /* Exposed for tests/test_cookbook.c only. */

@@ -1,0 +1,497 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <assert.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include "cexpress.h"
+#include "cluster.h"
+
+static void test_cluster_resolve_worker_count(void) {
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) {
+        ncpu = 1;
+    }
+    if (ncpu > MAX_CLUSTER_WORKERS) {
+        ncpu = MAX_CLUSTER_WORKERS;
+    }
+
+    assert(cluster_resolve_worker_count(0) == (int)ncpu);
+    assert(cluster_resolve_worker_count(-1) == (int)ncpu);
+    assert(cluster_resolve_worker_count(1) == 1);
+    assert(cluster_resolve_worker_count(4) == 4);
+    assert(cluster_resolve_worker_count(MAX_CLUSTER_WORKERS) == MAX_CLUSTER_WORKERS);
+    assert(cluster_resolve_worker_count(MAX_CLUSTER_WORKERS + 50) == MAX_CLUSTER_WORKERS);
+}
+
+static void test_cluster_worker_identification(void) {
+    /* Standalone / test process is not a cluster worker */
+    assert(cluster_is_worker() == 0);
+    assert(cluster_worker_id() == -1);
+}
+
+/* Raw OS-level check only: two sockets CAN share a port via SO_REUSEPORT, independent of what the
+ * cluster module actually does with that capability. On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR),
+ * cluster_listen no longer relies on the kernel balancing across such sockets - only the master binds
+ * one and hands fds to workers itself - so this test's pass/fail is unrelated to worker balance;
+ * see test_cluster_balances_across_workers for that. Left in place: it's still a valid, useful check
+ * of the primitive itself. */
+static void test_so_reuseport_multi_bind(void) {
+    int s1 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(s1 >= 0);
+
+    const int opt = 1;
+    assert(setsockopt(s1, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+#ifdef SO_REUSEPORT
+    assert(setsockopt(s1, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == 0);
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0); /* ephemeral port */
+
+    assert(bind(s1, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(listen(s1, 16) == 0);
+
+    socklen_t len = sizeof(addr);
+    assert(getsockname(s1, (struct sockaddr *)&addr, &len) == 0);
+    int assigned_port = ntohs(addr.sin_port);
+    assert(assigned_port > 0);
+
+    /* Second socket binding to the exact same IP and port */
+    int s2 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(s2 >= 0);
+    assert(setsockopt(s2, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+#ifdef SO_REUSEPORT
+    assert(setsockopt(s2, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == 0);
+#endif
+    assert(bind(s2, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(listen(s2, 16) == 0);
+
+    close(s1);
+    close(s2);
+}
+
+static void ping_handler(const Request *req, Response *res) {
+    (void)req;
+    res_send(res, "pong");
+}
+
+static void worker_id_handler(const Request *req, Response *res) {
+    (void)req;
+    char body[16];
+    snprintf(body, sizeof(body), "%d", cluster_worker_id());
+    res_send(res, body);
+}
+
+static int get_ephemeral_port(void) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    assert(s >= 0);
+
+    const int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+
+    assert(bind(s, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    socklen_t len = sizeof(addr);
+    assert(getsockname(s, (struct sockaddr *)&addr, &len) == 0);
+    int port = ntohs(addr.sin_port);
+    close(s);
+    return port;
+}
+
+static void test_cluster_http_serving_and_shutdown(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+
+    if (master_pid == 0) {
+        /* In test master process */
+        App app;
+        app_init(&app);
+        app.config.workers = 2;
+        app_get(&app, "/ping", ping_handler);
+
+        /* Redirection removed for debugging */
+
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    /* In parent test runner process: wait for cluster to initialize */
+    struct timespec delay = {0, 200000000L}; /* 200ms */
+    nanosleep(&delay, NULL);
+
+    /* Issue HTTP requests to the cluster */
+    int client_fd = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        client_fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(client_fd >= 0);
+
+        struct sockaddr_in srv_addr;
+        memset(&srv_addr, 0, sizeof(srv_addr));
+        srv_addr.sin_family = AF_INET;
+        srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        srv_addr.sin_port = htons(test_port);
+
+        if (connect(client_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) == 0) {
+            break;
+        }
+        close(client_fd);
+        client_fd = -1;
+        nanosleep(&delay, NULL);
+    }
+    assert(client_fd >= 0);
+
+    const char *req_str = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    ssize_t sent = write(client_fd, req_str, strlen(req_str));
+    assert(sent == (ssize_t)strlen(req_str));
+
+    char buf[1024];
+    memset(buf, 0, sizeof(buf));
+    ssize_t nread = read(client_fd, buf, sizeof(buf) - 1);
+    assert(nread > 0);
+    assert(strstr(buf, "200 OK") != NULL);
+    assert(strstr(buf, "pong") != NULL);
+    close(client_fd);
+
+    /* Send SIGTERM to the cluster master */
+    assert(kill(master_pid, SIGTERM) == 0);
+
+    /* Wait for cluster master to cleanly terminate */
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    if (!WIFEXITED(status)) {
+        printf("Master process did not exit normally. WIFSIGNALED: %d, WTERMSIG: %d\n", WIFSIGNALED(status), WTERMSIG(status));
+        fflush(stdout);
+    }
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+}
+
+/* Connects, sends one GET, reads the worker id worker_id_handler wrote into the body, and closes -
+ * a fresh connection (and thus, on this loopback client, a fresh ephemeral source port) every call,
+ * so repeated calls exercise a cluster's connection distribution across workers the same way
+ * independent real clients would. Returns the parsed worker id, or -1 on any failure. */
+static int request_worker_id(int port) {
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srv_addr.sin_port = htons(port);
+
+    if (connect(client_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    const char *req_str = "GET /worker-id HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if (write(client_fd, req_str, strlen(req_str)) != (ssize_t)strlen(req_str)) {
+        close(client_fd);
+        return -1;
+    }
+
+    char buf[256];
+    memset(buf, 0, sizeof(buf));
+    ssize_t nread = read(client_fd, buf, sizeof(buf) - 1);
+    close(client_fd);
+    if (nread <= 0) {
+        return -1;
+    }
+
+    const char *body = strstr(buf, "\r\n\r\n");
+    if (body == NULL) {
+        return -1;
+    }
+    return atoi(body + 4);
+}
+
+/* MEASURED (improvements.md) that per-worker SO_REUSEPORT listen sockets on macOS do not balance
+ * accepted connections across workers - over 90% of load landed on a single worker of four. This is
+ * the direct regression test: a real 4-worker cluster must actually spread sequential, independently
+ * connected requests across more than just one worker id. */
+static void test_cluster_balances_across_workers(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+
+    if (master_pid == 0) {
+        App app;
+        app_init(&app);
+        app.config.workers = 4;
+        app_get(&app, "/worker-id", worker_id_handler);
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    struct timespec delay = {0, 200000000L}; /* 200ms */
+    nanosleep(&delay, NULL);
+
+    enum { NUM_REQUESTS = 40 };
+    int seen[MAX_CLUSTER_WORKERS];
+    memset(seen, 0, sizeof(seen));
+    int distinct = 0;
+
+    for (int i = 0; i < NUM_REQUESTS; i++) {
+        int id = -1;
+        /* The first few requests may race the cluster still spawning workers; retry briefly. */
+        for (int retry = 0; retry < 10 && id < 0; retry++) {
+            id = request_worker_id(test_port);
+            if (id < 0) {
+                nanosleep(&delay, NULL);
+            }
+        }
+        assert(id >= 0 && id < MAX_CLUSTER_WORKERS);
+        if (!seen[id]) {
+            seen[id] = 1;
+            distinct++;
+        }
+    }
+
+    assert(kill(master_pid, SIGTERM) == 0);
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+
+    /* The direct regression: more than one of the 4 workers actually served a request. A naive
+     * version of this test under the pre-fix per-worker-SO_REUSEPORT path would very plausibly see
+     * distinct == 1 here, matching the ~90%+-to-one-worker imbalance improvements.md measured. */
+    assert(distinct > 1);
+}
+
+/* before this fix, a fatal, permanent misconfiguration (the port already taken) made every one of
+ * WORKERS children fail create_server_socket's own bind() identically, and the master respawned each
+ * one instantly forever - MEASURED (improvements.md) 10,594 respawns in about 4 seconds with
+ * WORKERS=2. cluster_listen now verifies the port itself, once, before forking anyone. */
+static void test_cluster_master_exits_fast_when_port_is_taken(void) {
+    int blocker_port = get_ephemeral_port();
+
+    /* Occupy the port on the exact same address create_server_socket binds (INADDR_ANY) without
+     * SO_REUSEPORT, so the master's own preflight bind (create_server_socket does set SO_REUSEPORT on
+     * itself, but REUSEPORT only lets sockets share a port when every one of them opts in) fails
+     * exactly like a real "something else is already listening here" misconfiguration would - a
+     * mismatched address (e.g. loopback-only vs. wildcard) can coexist on some stacks even without
+     * REUSEPORT, which would defeat this test. */
+    int blocker_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(blocker_fd >= 0);
+    const int opt = 1;
+    assert(setsockopt(blocker_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(blocker_port);
+    assert(bind(blocker_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(listen(blocker_fd, 16) == 0);
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+    if (master_pid == 0) {
+        close(blocker_fd); /* this fd is the parent's end of the blocker; the child doesn't need it */
+        App app;
+        app_init(&app);
+        app.config.workers = 2;
+        app_listen(&app, blocker_port); /* expected to exit() from within create_server_socket's own
+                                          * bind() failure before this call ever returns */
+        app_destroy(&app);
+        exit(0); /* unreachable if the preflight check did its job */
+    }
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    const double elapsed = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
+
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) != 0); /* create_server_socket's own exit(EXIT_FAILURE) */
+    assert(elapsed < 2.0); /* MEASURED: the old code was still respawning thousands of times/sec at 4s */
+
+    close(blocker_fd);
+}
+
+/* Reads until EOF or error, with a receive timeout. Returns 1 when the peer closed the stream (read()
+ * returned 0) and the bytes read contain `expect`, 0 otherwise (timeout, reset, or wrong body). */
+static int read_until_eof_contains(int fd, const char *expect, int timeout_s) {
+    struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        return 0;
+    }
+    char buf[1024];
+    size_t used = 0;
+    while (1) {
+        if (used == sizeof(buf) - 1) {
+            used = 0; /* only the tail matters for these tiny responses */
+        }
+        const ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+        if (n == 0) {
+            buf[used] = '\0';
+            return strstr(buf, expect) != NULL;
+        }
+        if (n < 0) {
+            return 0;
+        }
+        used += (size_t)n;
+    }
+}
+
+static int connect_loopback(int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srv_addr.sin_port = htons(port);
+    if (connect(fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* On macOS/BSD (CEXPRESS_SINGLE_ACCEPTOR) the master used to keep its copy of every client fd it
+ * handed to a worker. Two visible effects, both checked here: a Connection: close response never
+ * reached EOF at the client (the worker's close() sent no FIN while the master still held the socket),
+ * and the master ran out of fds - MEASURED with `ulimit -n 64`, every request after the 57th failed.
+ * The master runs with RLIMIT_NOFILE 64 and must serve far more than 64 sequential connections, each
+ * ending in EOF well before the timeout. On Linux (per-worker SO_REUSEPORT) this passes trivially. */
+static void test_cluster_master_does_not_leak_client_fds(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+    if (master_pid == 0) {
+        const struct rlimit lim = { .rlim_cur = 64, .rlim_max = 64 };
+        if (setrlimit(RLIMIT_NOFILE, &lim) != 0) {
+            exit(3);
+        }
+        App app;
+        app_init(&app);
+        app.config.workers = 2;
+        app_get(&app, "/ping", ping_handler);
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    struct timespec delay = {0, 200000000L}; /* 200ms */
+    nanosleep(&delay, NULL);
+
+    const char *req_str = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    enum { NUM_REQUESTS = 150 };
+    for (int i = 0; i < NUM_REQUESTS; i++) {
+        int fd = -1;
+        /* The first request may race the cluster still spawning workers; retry briefly. */
+        for (int retry = 0; retry < 10 && fd < 0; retry++) {
+            fd = connect_loopback(test_port);
+            if (fd < 0) {
+                nanosleep(&delay, NULL);
+            }
+        }
+        assert(fd >= 0);
+        assert(write(fd, req_str, strlen(req_str)) == (ssize_t)strlen(req_str));
+        const int ok = read_until_eof_contains(fd, "pong", 2);
+        close(fd);
+        if (!ok) {
+            printf("request %d: no complete response ending in EOF\n", i);
+            fflush(stdout);
+            /* Drain the cluster before failing, or its orphaned workers keep the port (and any pipe
+             * on stdout) open after this runner aborts. */
+            kill(master_pid, SIGTERM);
+            waitpid(master_pid, NULL, 0);
+        }
+        assert(ok);
+    }
+
+    assert(kill(master_pid, SIGTERM) == 0);
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
+}
+
+static void crash_immediately_hook(void) {
+    /* Simulates a worker that can never come up (a real crash, a bad config only that process hits,
+     * ...): exits with a fixed nonzero code the instant it starts, before any socket work, so each
+     * respawn attempt fails as fast and deterministically as possible. */
+    exit(7);
+}
+
+/* the restart budget - a worker that keeps failing must not be respawned forever. With
+ * CLUSTER_RESTART_BUDGET failures exhausted, the master gives up and exits non-zero instead of
+ * looping (with increasing backoff) indefinitely. */
+static void test_cluster_master_exits_after_restart_budget_exceeded(void) {
+    int test_port = get_ephemeral_port();
+
+    pid_t master_pid = fork();
+    assert(master_pid >= 0);
+    if (master_pid == 0) {
+        App app;
+        app_init(&app);
+        app.config.workers = 2;
+        app_on_worker_start(&app, crash_immediately_hook);
+        app_listen(&app, test_port);
+        app_destroy(&app);
+        exit(0);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(master_pid, &status, 0);
+    assert(waited == master_pid);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 1); /* EXIT_FAILURE from cluster_listen's own exit(), see lib/CLAUDE.md */
+}
+
+int main(void) {
+    test_cluster_resolve_worker_count();
+    test_cluster_worker_identification();
+    test_so_reuseport_multi_bind();
+    test_cluster_http_serving_and_shutdown();
+    test_cluster_balances_across_workers();
+    test_cluster_master_does_not_leak_client_fds();
+    test_cluster_master_exits_fast_when_port_is_taken();
+    test_cluster_master_exits_after_restart_budget_exceeded();
+
+    printf("all cluster tests passed\n");
+    return 0;
+}

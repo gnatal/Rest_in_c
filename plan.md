@@ -1,114 +1,111 @@
-# Rest_in_c Implementation Plan & Phased Roadmap
+# Project: RealWorld (Conduit) API Implementation
+## Goal
+Implement the backend API specification for the RealWorld "Conduit" application (a Medium.com clone) to serve as a benchmark and integration test.
 
-A production-grade REST API in pure C11 powered by the **CExpress** web engine.
-This document outlines the architecture, data models, endpoints, and step-by-step phases so development can proceed predictably and cleanly.
+## Technical Constraints & Stack
+- **Language:** C11.
+- **Framework:** CExpress (a custom, lightweight, open-source HTTP server framework with Express-like routing and middleware patterns, designed for low-memory, high-throughput services).
+- **Database:** SQLite3 (via raw C bindings) to minimize external dependencies during benchmarking, or PostgreSQL if preferred for concurrency.
+- **Memory Management:** Strict adherence to C11 memory safety. The agent must document any heap allocations and ensure corresponding `free()` calls within the request lifecycle.
+- **JSON Handling:** Use `cJSON` (or specified C library) for parsing incoming payloads and formatting the strict RealWorld JSON response structures.
 
----
-
-## 1. System Architecture Overview
-
-```text
-Rest_in_c/
-├── vendor/
-│   └── cexpress/             # Pure CExpress engine (lib/ only, zero app/ conflicts)
-│       ├── lib/              # Event loop, HTTP parser, TLS, Router, Response, JSON
-│       ├── API.md            # Quick reference index of all CExpress functions
-│       ├── examples/         # cookbook.c recipes
-│       └── Makefile          # Builds build/lib/libcexpress.a without SQLite
-├── src/
-│   ├── common/               # Shared helpers
-│   │   ├── json_util.h/.c    # Standard JSON serialization & error helpers
-│   │   └── crypto.h/.c       # OpenSSL PBKDF2-HMAC-SHA256 & random token generation
-│   ├── models/               # Data structures & in-memory thread-safe repositories
-│   │   ├── types.h           # Core structs: User, Role, SessionToken, PasswordResetToken, Todo
-│   │   ├── user_store.h/.c   # Thread-safe user storage, uniqueness checks, seed admin
-│   │   ├── token_store.h/.c  # Active sessions & single-use password reset tokens
-│   │   └── todo_store.h/.c   # User-scoped Todo repository with CRUD operations
-│   ├── middleware/           # HTTP Request/Response interceptors
-│   │   ├── cors.h/.c         # Cross-Origin headers
-│   │   ├── logger.h/.c       # Request logger with timestamps
-│   │   └── auth.h/.c         # Bearer/Cookie token authentication & role guards
-│   ├── routes/               # API route definitions
-│   │   ├── auth_routes.h/.c  # Signup, Signin, Forgot Password, Reset Password
-│   │   ├── user_routes.h/.c  # Current user profile
-│   │   └── todo_routes.h/.c  # User-filtered and Admin-filtered Todo CRUD
-│   └── main.c                # Server bootstrap, middleware registration, graceful drain
-├── Makefile                  # Cross-platform build system (macOS / Linux)
-├── AGENTS.md / CLAUDE.md     # AI context guidelines and memory rules
-├── plan.md                   # This roadmap
-└── test_api.sh               # End-to-end integration test suite
-```
+## CExpress Paradigm Guide for the Agent
+Since CExpress is a custom framework, adhere to the following architectural patterns:
+1. **Routing:** Mount handlers similarly to Express.js (e.g., matching HTTP verbs and route parameters).
+2. **Middleware:** Implement Authentication (JWT verification) as a middleware function that intercepts requests to protected routes `/api/user`, `/api/articles`, etc., before passing control to the final controller.
+3. **Error Handling:** All validation errors must be caught and returned matching the exact RealWorld specification: `{"errors": {"body": ["can't be empty"]}}`.
 
 ---
 
-## 2. API Endpoints Specification
+## Execution Phases
 
-| Method | Endpoint | Protection | Description | Status Code |
-| :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | Public | Service health & server uptime | `200` |
-| `POST` | `/api/signup` | Public | Register new account (`email`, `name`, `password`, `role`) | `201` |
-| `POST` | `/api/signin` | Public | Authenticate credentials; returns token & sets cookie | `200` |
-| `POST` | `/api/forgot_password` | Public | Request a password reset token for account | `200` |
-| `POST` | `/api/reset_password` | Public | Reset password using valid reset token | `200` |
-| `GET` | `/api/user` | Authenticated | Get current authenticated user profile & role | `200` |
-| `GET` | `/api/todos` | Authenticated | List todos for current user (`?completed=true\|false`) | `200` |
-| `POST` | `/api/todos` | Authenticated | Create a todo assigned to current user | `201` |
-| `GET` | `/api/todos/:id` | Owner / Admin | Retrieve a specific todo by ID | `200` / `403` / `404` |
-| `PUT` | `/api/todos/:id` | Owner / Admin | Update title, description, or completed status | `200` / `403` / `404` |
-| `DELETE`| `/api/todos/:id` | Owner / Admin | Delete a specific todo | `200` / `403` / `404` |
+### Phase 1: Core Scaffolding & User Authentication
+1. Initialize the CExpress server entry point (`main.c`) and mount the base `/api` router.
+2. Implement the SQLite database schema for the `users` table.
+3. Build the JWT generation and verification logic in C.
+4. Implement endpoints:
+   - `POST /api/users` (Register)
+   - `POST /api/users/login` (Login)
+   - `GET /api/user` (Current User - protected)
+5. **Artifact Required:** A verified Postman collection run against the User endpoints showing 200 OK and 401 Unauthorized for missing tokens.
 
----
+### Phase 2: Articles & Relational Data
+1. Implement the database schema for `articles`, `tags`, and the many-to-many relationship for `article_tags`.
+2. Build the CRUD controllers for Articles, ensuring the routing handles slug-based URLs (`/api/articles/:slug`).
+3. Implement author authorization (only the creator can update/delete an article).
+4. **Artifact Required:** A brief summary of how the C struct mapping is handling the nested JSON required for the Article response (including the `author` profile object).
 
-## 3. Phased Implementation Roadmap
+### Phase 3: Social Graph (Profiles, Favorites, Comments)
+1. Implement the `followers` join table and the Profile endpoints (`/api/profiles/:username`).
+2. Implement the `favorites` join table and endpoints (`POST/DELETE /api/articles/:slug/favorite`).
+3. Implement `comments` linked to articles.
+4. **Artifact Required:** Successful execution of the official RealWorld Postman backend test suite against the local CExpress instance.
 
-### Phase 1: Clean Foundation & Scaffolding
-- [x] Create project layout (`src/common`, `src/models`, `src/middleware`, `src/routes`)
-- [x] Configure cross-platform `Makefile` with OpenSSL detection and header dependency tracking
-- [x] Provide AI context files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`)
-- [ ] Export CExpress engine into `vendor/cexpress` without the demo `app/` folder (Option 1)
-- [x] Implement standardized JSON utilities (`src/common/json_util.h/.c`)
-- [x] Implement global middlewares (CORS, Logger, JSON Error Handler)
-- [x] Build and verify baseline server with `GET /health`
+-- Enable foreign key support (Crucial: The agent must execute this PRAGMA on every new SQLite connection)
+PRAGMA foreign_keys = ON;
 
-### Phase 2: Authentication & User Management
-- [x] Core data models in `src/models/types.h` (`User`, `Role`, `SessionToken`, `PasswordResetToken`, `Todo`)
-- [x] Cryptographic utilities in `src/common/crypto.h/.c` using OpenSSL PBKDF2 and secure random bytes
-- [x] Thread-safe `UserStore` in `src/models/user_store.h/.c` with seeded default admin account
-- [x] Thread-safe `TokenStore` in `src/models/token_store.h/.c` for active sessions and password reset tokens
-- [x] Auth middlewares in `src/middleware/auth.h/.c` (`mw_authenticate`, `mw_require_admin`)
-- [x] Auth route handlers in `src/routes/auth_routes.h/.c`:
-  - `POST /api/signup`
-  - `POST /api/signin`
-  - `POST /api/forgot_password`
-  - `POST /api/reset_password`
-- [x] User route handler in `src/routes/user_routes.h/.c`:
-  - `GET /api/user`
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    bio TEXT,
+    image TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 
-### Phase 3: Role-Based Access Control & User-Scoped Todos
-- [x] Thread-safe `TodoStore` in `src/models/todo_store.h/.c`:
-  - Scoped by `user_id` or queryable across all users
-  - CRUD operations (create, read, update, delete, filter by completion)
-- [ ] Todo route handlers in `src/routes/todo_routes.h/.c`:
-  - `GET /api/todos`: Scoped to caller user ID (`ROLE_ADMIN` can view all or filter by user)
-  - `POST /api/todos`: Assigns created todo to caller user ID
-  - `GET /api/todos/:id`: Enforces ownership (owner or admin only)
-  - `PUT /api/todos/:id`: Enforces ownership (owner or admin only)
-  - `DELETE /api/todos/:id`: Enforces ownership (owner or admin only)
-- [ ] Wire all sub-routes into `src/main.c`
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    body TEXT NOT NULL,
+    author_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
 
-### Phase 4: Automated Testing & Verification
-- [ ] Create `test_api.sh` end-to-end integration test suite using `curl`:
-  1. Healthcheck (`GET /health`)
-  2. Public signup (`POST /api/signup`)
-  3. Duplicate email conflict rejection (`409 Conflict`)
-  4. Authentication (`POST /api/signin`)
-  5. Password recovery flow (`POST /api/forgot_password` -> `POST /api/reset_password`)
-  6. Authenticated profile (`GET /api/user`)
-  7. Unauthorized access check (`401 Unauthorized` without token)
-  8. User-scoped Todo lifecycle (Create, List, Update, Delete)
-  9. Cross-user isolation check (`403 Forbidden` when attempting to access another user's todo)
-  10. Admin override check (Admin accessing user's todo)
+CREATE TABLE comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    body TEXT NOT NULL,
+    article_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
 
-### Phase 5: Documentation & Polish
-- [ ] Create `README.md` with full setup instructions, curl examples, and design notes.
-- [ ] Verify zero memory leaks or dangling pointers.
+CREATE TABLE tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+);
+
+-- Junction table for the Many-to-Many relationship between Articles and Tags
+CREATE TABLE article_tags (
+    article_id INTEGER NOT NULL,
+    tag_id INTEGER NOT NULL,
+    PRIMARY KEY (article_id, tag_id),
+    FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+);
+
+-- Junction table for Users favoriting Articles
+CREATE TABLE favorites (
+    user_id INTEGER NOT NULL,
+    article_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, article_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
+);
+
+-- Junction table for Users following other Users
+CREATE TABLE followers (
+    follower_id INTEGER NOT NULL,
+    followed_id INTEGER NOT NULL,
+    PRIMARY KEY (follower_id, followed_id),
+    FOREIGN KEY (follower_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (followed_id) REFERENCES users(id) ON DELETE CASCADE
+);

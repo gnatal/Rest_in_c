@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include "static.h"
 #include "response.h"
@@ -44,6 +45,9 @@ int static_resolve_relative_path(const char *mount_pattern, const char *req_path
     while (tok != NULL) {
         if (strcmp(tok, "..") == 0) {
             return -1;
+        }
+        if (tok[0] == '.') {
+            return -2; /* dotfile or dot-directory (.env, .git/config, .htpasswd): hidden, not forbidden */
         }
         const size_t tok_len = strlen(tok);
         const size_t needed = tok_len + (wrote_any ? 1 : 0);
@@ -135,9 +139,175 @@ static int resolve_and_stat(const char *root, const char *candidate, char *resol
     return 1;
 }
 
+/*
+ * A small in-memory cache of recently served static files, so the common case (a handful of
+ * assets requested repeatedly) skips realpath()/stat()/fopen()/fread()/malloc()/free() on every request
+ * instead of paying for all of it every time - MEASURED (improvements.md) at 6.6x slower than an
+ * equivalent in-memory response for a 52-byte file. Keyed by the *candidate* path (static_root + the
+ * already-sanitized subpath) rather than the realpath()-resolved one: that is what lets a hit within
+ * STATIC_CACHE_REVALIDATE_SECONDS of its last check skip realpath()/stat() too, not just the read - see
+ * cache_lookup_fresh below, and lib/CLAUDE.md's "Static" note for the resulting trade-off (a symlink
+ * swapped in-place can serve stale content for up to that window). Entries are process-lifetime, shared
+ * across every mount (two different mounts can never resolve to the same candidate string, each being
+ * rooted under its own canonical static_root) and bounded by STATIC_CACHE_MAX_ENTRIES *
+ * STATIC_CACHE_MAX_ENTRY_BYTES <= STATIC_CACHE_MAX_TOTAL_BYTES (app_types.h; asserted below), so there is
+ * no separate per-insert total-bytes accounting to get wrong - capping entry count alone caps total bytes.
+ */
+_Static_assert((size_t)STATIC_CACHE_MAX_ENTRIES * STATIC_CACHE_MAX_ENTRY_BYTES <= STATIC_CACHE_MAX_TOTAL_BYTES,
+               "static cache: entries * per-entry cap must not exceed the total cap (cache_insert relies on this)");
+
+static StaticCacheEntry g_static_cache[STATIC_CACHE_MAX_ENTRIES];
+static int g_static_cache_count = 0;
+
+static char *dup_path(const char *s) {
+    const size_t len = strlen(s) + 1;
+    char *out = malloc(len);
+    if (out != NULL) {
+        memcpy(out, s, len);
+    }
+    return out;
+}
+
+uint64_t static_path_hash(const char *path) {
+    uint64_t hash = 0xcbf29ce484222325ULL; /* FNV-1a 64-bit offset basis */
+    for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+        hash ^= *p;
+        hash *= 0x100000001b3ULL; /* FNV-1a 64-bit prime */
+    }
+    return hash;
+}
+
+/* static_path_hash(path), computed at most once per request: `*memo` is 0 until the first call fills it
+ * (a path whose real hash is 0 is just rehashed, still correct). */
+static uint64_t memo_path_hash(const char *path, uint64_t *memo) {
+    if (*memo == 0) {
+        *memo = static_path_hash(path);
+    }
+    return *memo;
+}
+
+/* Below STATIC_CACHE_HASH_MIN_ENTRIES a plain strcmp scan is cheaper than hashing the candidate at all
+ * (MEASURED, improvements.md); at or above it, the stored path_hash is compared before strcmp. */
+static StaticCacheEntry *cache_find(const char *path, uint64_t *hash_memo) {
+    if (g_static_cache_count < STATIC_CACHE_HASH_MIN_ENTRIES) {
+        for (int i = 0; i < g_static_cache_count; i++) {
+            if (strcmp(g_static_cache[i].path, path) == 0) {
+                return &g_static_cache[i];
+            }
+        }
+        return NULL;
+    }
+    const uint64_t hash = memo_path_hash(path, hash_memo);
+    for (int i = 0; i < g_static_cache_count; i++) {
+        if (g_static_cache[i].path_hash == hash && strcmp(g_static_cache[i].path, path) == 0) {
+            return &g_static_cache[i];
+        }
+    }
+    return NULL;
+}
+
+/* An entry for the same file (device + inode) whose body is still current (same mtime and size), cached
+ * under another candidate: a symlink or hard link inside the root, or a case variant on a case-insensitive
+ * filesystem. Its body is shared rather than read and held again. Linear; runs on a miss only. */
+static StaticCacheEntry *cache_find_same_file(const struct stat *st) {
+    for (int i = 0; i < g_static_cache_count; i++) {
+        StaticCacheEntry *const entry = &g_static_cache[i];
+        if (entry->ino == st->st_ino && entry->dev == st->st_dev && entry->mtime == st->st_mtime &&
+            entry->body->len == (size_t)st->st_size) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* Frees the least-recently-confirmed-fresh entry's owned memory to make room for a new one. */
+static void cache_evict_stalest(void) {
+    if (g_static_cache_count == 0) {
+        return;
+    }
+    int oldest = 0;
+    for (int i = 1; i < g_static_cache_count; i++) {
+        if (g_static_cache[i].last_checked < g_static_cache[oldest].last_checked) {
+            oldest = i;
+        }
+    }
+    free(g_static_cache[oldest].path);
+    shared_body_release(g_static_cache[oldest].body); /* a response still sending it holds its own reference */
+    g_static_cache[oldest] = g_static_cache[g_static_cache_count - 1];
+    g_static_cache_count--;
+}
+
+/*
+ * A hit within STATIC_CACHE_REVALIDATE_SECONDS of its last check needs no filesystem call at all - the
+ * fast path that closes most of the gap to an in-memory res_send_bytes response. NULL if there is no
+ * entry for `path`, or its check is stale enough that the caller must fall back to resolve_and_stat.
+ */
+static const StaticCacheEntry *cache_lookup_fresh(const char *path, uint64_t *hash_memo, time_t now) {
+    const StaticCacheEntry *entry = cache_find(path, hash_memo);
+    if (entry != NULL && now - entry->last_checked < STATIC_CACHE_REVALIDATE_SECONDS) {
+        return entry;
+    }
+    return NULL;
+}
+
+/*
+ * Takes over the caller's reference to `body` on success (0): the cache releases it on eviction,
+ * replacement or static_cache_clear. On failure (-1: the file is too large for the cache, or the cache is
+ * out of memory for its own bookkeeping) the caller still holds that reference and must release it.
+ * `content_type` must have static storage duration (static_mime_type's return value qualifies); nothing
+ * here ever frees it.
+ */
+static int cache_insert(const char *path, uint64_t *hash_memo, SharedBody *body, const struct stat *st,
+                        const char *content_type, time_t now) {
+    if (body->len > STATIC_CACHE_MAX_ENTRY_BYTES) {
+        return -1;
+    }
+
+    StaticCacheEntry *entry = cache_find(path, hash_memo);
+    if (entry == NULL) {
+        if (g_static_cache_count >= STATIC_CACHE_MAX_ENTRIES) {
+            cache_evict_stalest();
+        }
+        char *key = dup_path(path);
+        if (key == NULL) {
+            return -1;
+        }
+        entry = &g_static_cache[g_static_cache_count++];
+        entry->path = key;
+        entry->path_hash = memo_path_hash(path, hash_memo); /* always stored: the table may grow past the threshold */
+        entry->body = NULL;
+    }
+
+    shared_body_release(entry->body);
+    entry->body = body;
+    entry->mtime = st->st_mtime;
+    entry->dev = st->st_dev;
+    entry->ino = st->st_ino;
+    entry->last_checked = now;
+    entry->content_type = content_type;
+    return 0;
+}
+
+void static_cache_clear(void) {
+    for (int i = 0; i < g_static_cache_count; i++) {
+        free(g_static_cache[i].path);
+        shared_body_release(g_static_cache[i].body);
+    }
+    g_static_cache_count = 0;
+}
+
 void static_serve_file(const Route *route, const Request *req, Response *res) {
+    /* on every answer, so a browser never sniffs a served .txt or upload into HTML/script */
+    res_set_header(res, "X-Content-Type-Options", "nosniff");
+
     char subpath[PATH_MAX];
-    if (static_resolve_relative_path(route->path, req->path, subpath, sizeof(subpath)) != 0) {
+    const int resolved_rel = static_resolve_relative_path(route->path, req->path, subpath, sizeof(subpath));
+    if (resolved_rel == -2) {
+        res_status(res, 404);
+        res_send(res, "Not Found");
+        return;
+    }
+    if (resolved_rel != 0) {
         res_status(res, 403);
         res_send(res, "Forbidden");
         return;
@@ -148,6 +318,15 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
     if (n < 0 || (size_t)n >= sizeof(candidate)) {
         res_status(res, 500);
         res_send(res, "Internal Server Error");
+        return;
+    }
+
+    const time_t now = time(NULL);
+    uint64_t candidate_hash = 0; /* filled by the first lookup that needs it (memo_path_hash) */
+    const StaticCacheEntry *fresh = cache_lookup_fresh(candidate, &candidate_hash, now);
+    if (fresh != NULL) {
+        res_status(res, 200);
+        res_send_shared(res, fresh->content_type, fresh->body);
         return;
     }
 
@@ -194,6 +373,49 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
         return;
     }
 
+    /* Past realpath()/stat(): a cache entry for this candidate is either absent, or was last confirmed
+     * more than STATIC_CACHE_REVALIDATE_SECONDS ago. If the file is unchanged since then, reuse its
+     * cached bytes instead of paying for fopen/fread again - the common case once a server has been up
+     * for more than a second: one stat per file per second, not one full read. */
+    StaticCacheEntry *existing = cache_find(candidate, &candidate_hash);
+    if (existing != NULL && existing->mtime == st.st_mtime && existing->body->len == (size_t)st.st_size) {
+        existing->last_checked = now;
+        res_status(res, 200);
+        res_send_shared(res, existing->content_type, existing->body);
+        return;
+    }
+
+    const char *content_type = static_mime_type(resolved);
+
+    /* Too big to cache: stream it from disk (res_send_file, STREAM_CHUNK_SIZE per turn through
+     * conn->stream_buf) instead of reading it whole. Reading it would block the event loop for the
+     * whole fread, then hold the file's size in memory up to three times per request (the read buffer,
+     * the arena copy, and flush_connection's owned tail on the first EAGAIN) for as long as a slow
+     * client takes to read it - MEASURED 452 MB RSS for ten rate-limited downloads of a 40 MiB file. */
+    if ((size_t)st.st_size > (size_t)STATIC_CACHE_MAX_ENTRY_BYTES) {
+        res_status(res, 200);
+        if (res_send_file(res, content_type, resolved) != 0) {
+            /* gone or replaced by a non-regular file since the stat above; nothing was sent */
+            res_status(res, 404);
+            res_send(res, "Not Found");
+        }
+        return;
+    }
+
+    /* Another name for a file already cached (symlink, hard link, case variant): share its bytes. The new
+     * entry keys this candidate so its next hit takes the fast path; both entries hold one reference. */
+    const StaticCacheEntry *same_file = cache_find_same_file(&st);
+    if (same_file != NULL) {
+        SharedBody *const shared = same_file->body;
+        shared_body_retain(shared); /* our reference: handed to the cache, or released below */
+        res_status(res, 200);
+        res_send_shared(res, content_type, shared);
+        if (cache_insert(candidate, &candidate_hash, shared, &st, content_type, now) != 0) {
+            shared_body_release(shared);
+        }
+        return;
+    }
+
     FILE *f = fopen(resolved, "rb");
     if (f == NULL) {
         res_status(res, 404);
@@ -202,28 +424,28 @@ void static_serve_file(const Route *route, const Request *req, Response *res) {
     }
 
     const size_t size = (size_t)st.st_size;
-    unsigned char *buf = NULL;
-    if (size > 0) {
-        buf = malloc(size);
-        if (buf == NULL) {
-            fclose(f);
-            res_status(res, 500);
-            res_send(res, "Internal Server Error");
-            return;
-        }
-        const size_t read_bytes = fread(buf, 1, size, f);
+    SharedBody *body = shared_body_new(size); /* our reference: handed to the cache, or released below */
+    if (body == NULL) {
         fclose(f);
-        if (read_bytes != size) {
-            free(buf);
-            res_status(res, 500);
-            res_send(res, "Internal Server Error");
-            return;
-        }
-    } else {
-        fclose(f);
+        res_status(res, 500);
+        res_send(res, "Internal Server Error");
+        return;
+    }
+    const size_t read_bytes = size > 0 ? fread(body->data, 1, size, f) : 0;
+    fclose(f);
+    if (read_bytes != size) {
+        shared_body_release(body);
+        res_status(res, 500);
+        res_send(res, "Internal Server Error");
+        return;
     }
 
     res_status(res, 200);
-    res_send_bytes(res, static_mime_type(resolved), buf, size);
-    free(buf);
+    res_send_shared(res, content_type, body); /* the connection takes its own reference */
+
+    /* cache_insert takes our reference on success (0); on failure (too big to cache, or out of memory for
+     * the cache's own bookkeeping) we still hold it - never a double release, never a leak either way. */
+    if (cache_insert(candidate, &candidate_hash, body, &st, content_type, now) != 0) {
+        shared_body_release(body);
+    }
 }

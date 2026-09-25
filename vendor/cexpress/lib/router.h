@@ -14,13 +14,16 @@
  *                     segment and captures nothing
  *   trailing '*'      as the LAST segment (files, then '*') matches one or more remaining segments;
  *                     the bare prefix ("/files") does not match
- * First registered match wins. HEAD falls back to the GET route for the same path unless an explicit
- * HEAD route exists. OPTIONS on a known path answers 200 + Allow without an explicit route.
- * Limits: MAX_ROUTES (32) per App/Router, MAX_ROUTE_MIDDLEWARES (8) per route; excess is dropped with
+ * Matching walks a per-method tree of path segments: a literal segment beats ':name', which beats '*',
+ * whatever the registration order ("/users/me" wins over "/users/:id"). A second registration of the same pattern
+ * is ignored with a warning. Use the same ':name' at the same position in every route: the capture is stored under
+ * the name of the first route registered there (lib/CLAUDE.md, "Known gaps"). HEAD falls back to the GET route for
+ * the same path unless an explicit HEAD route exists. OPTIONS on a known path answers 200 + Allow without an explicit route.
+ * Limits: dynamically allocated routes per App, MAX_ROUTER_ROUTES (64) per Router, MAX_ROUTE_MIDDLEWARES (8) per route; excess is dropped with
  * a stderr warning, not overflowed. Strings are copied, the caller's buffers need not outlive the call.
  */
 
-/* Resets an App: zero routes/middleware, no error handler, no TLS, allocates the connection table. Pair with app_destroy. */
+/* Resets an App: zero routes/middleware, no error handler, allocates the connection table. Pair with app_destroy. */
 void app_init(App *app);
 
 /* Generic form; every helper below is this with a fixed method. `method` is upper-case ("GET"). */
@@ -57,7 +60,8 @@ void app_options_mw(App *app, const char *path, Handler handler, const Middlewar
  * match_path: 1 if `path` matches `pattern`. Captures ':name' segments into req (param_count is reset first);
  *   req may be NULL to test a match without capturing. Never writes outside req's param slots.
  * match_route: first route matching req->method and req->path (with the HEAD->GET fallback), or NULL.
- *   Fills req's path params for the matched route.
+ *   Fills req's path params from the matched route's OWN pattern, so routes may use different
+ *   ':name's at the same position ("/o/:id/items" and "/o/:oid/notes" each see their own name).
  * match_route_allowed_methods: comma-separated, de-duplicated methods of every route matching
  *   req->path, in registration order, into `allowed`; returns how many (0 = a true 404). Does not modify req.
  * req_get_param: captured value (percent-decoded, first match) or NULL.
@@ -100,12 +104,38 @@ void app_mount(App *app, const char *prefix, const Router *router);
  * realpath()'d at registration; a missing directory registers nothing (logged). Requests are refused
  * with 403 if they contain a ".." segment or resolve (symlinks included) outside root_dir, 404 if not
  * a regular file; a directory serves its index.html; there is never a directory listing. Files over
- * MAX_STATIC_FILE_SIZE (50 MiB) get 500. Counts as one route. App-level only (no router twin).
+ * MAX_STATIC_FILE_SIZE (50 MiB) get 500; files over 256 KiB (STATIC_CACHE_MAX_ENTRY_BYTES) are streamed
+ * from disk rather than read into memory. Counts as one route. App-level only (no router twin).
  */
 void app_serve_static(App *app, const char *prefix, const char *root_dir);
 
-/* Enables HTTPS with PEM files (TLS 1.2+). Returns 0, or -1 on bad arguments / path >= PATH_MAX.
- * The context is created per worker process at app_listen. */
-int app_enable_tls(App *app, const char *cert_file, const char *key_file);
+/*
+ * Per-route/prefix request body cap. A declared Content-Length above `max_bytes` for a request
+ * whose path falls under `prefix` (same segment-boundary rule as app_use_prefix: "" or "/" matches
+ * everything) is rejected with 413 as soon as headers are complete, before the body is buffered -
+ * tighter than waiting for the global MAX_BODY_SIZE (10 MiB) cap, and without reserving memory
+ * proportional to what the client merely claims it will send. `max_bytes` is clamped down to
+ * MAX_BODY_SIZE if given a larger value (it can only tighten the global cap, never loosen it); NULL
+ * or "" for prefix matches every path. The most specific (longest) matching prefix wins, independent
+ * of registration order. The prefix is matched against the canonical path (request_target_path:
+ * query dropped, percent-decoded, repeated '/' collapsed), so "/upload?x=1", "//upload" and
+ * "/%75pload" are all covered. Chunked bodies are covered too: the request gets 413 as soon as its
+ * validated chunks decode to more than `max_bytes`, or its raw chunked bytes outgrow `max_bytes`
+ * past the first BUF_SIZE read buffer. Limit: MAX_BODY_LIMITS (16) prefixes; excess is dropped with
+ * a stderr warning.
+ */
+void app_use_body_limit(App *app, const char *prefix, size_t max_bytes);
+
+/* The effective body-size cap for `path`: the longest app_use_body_limit prefix that matches it, or
+ * MAX_BODY_SIZE if none do. Exposed for the engine (connection.c) and tests. */
+size_t app_body_limit_for_path(const App *app, const char *path);
+
+/* app_body_limit_for_path for a raw request-target (still percent-encoded, may carry a query):
+ * canonicalized with request_target_path first. A target the parser would reject (400/414) gets
+ * MAX_BODY_SIZE - that request is answered with its own error once framed. */
+size_t app_body_limit_for_target(const App *app, const char *target, size_t target_len);
+
+/* Frees dynamically allocated route tree memory. Called by app_destroy. */
+void app_free_routes(App *app);
 
 #endif /* ROUTER_H */

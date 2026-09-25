@@ -7,8 +7,10 @@
 /*
  * Building a response. A handler produces exactly one response through ONE of:
  *   res_send / res_json / res_send_bytes / res_redirect   (whole body at once)
+ *   res_send_shared                                        (whole body by reference, not copied)
  *   res_write ... res_end                                  (chunked streaming)
  *   res_send_file                                          (file streamed from disk)
+ *   res_stream                                             (producer called by the event loop)
  * Order: res_status and res_set_header / res_set_cookie first, then the sending call.
  * Nothing here touches the socket: the bytes are built into conn->out_buf and written later by the
  * event loop (flush_connection). A second res_send in the same request replaces the first.
@@ -19,13 +21,16 @@
  * The engine calls this before every dispatch; unit tests may call it instead of memset. */
 void res_init(Response *res, Connection *conn);
 
-/* Sets the status code (default 200). */
+/* Sets the status code (default 200). a 1xx, 204 or 304 status makes the response bodiless - every
+ * sending call then emits the head only (no Content-Length / Transfer-Encoding, no default Content-Type,
+ * no body bytes, no trailers), whatever body it was given. */
 void res_status(Response *res, int status);
 
 /*
- * Sets a response header. Same name (case-insensitive) overwrites. Content-Length and Connection are
+ * Sets a response header. Same name (case-insensitive) overwrites. Content-Length, Connection and Date are
  * computed by the engine and rejected here (logged). A custom Content-Type replaces the default one.
- * Limits: MAX_RESPONSE_HEADERS; name truncated to 63 chars, value to 255; excess is dropped (logged).
+ * Limits: MAX_RESPONSE_HEADERS; a name over 63 chars is dropped (logged). The value is copied whole into the
+ * request arena, never shortened; if the finished head exceeds 8 KiB the connection is dropped (logged).
  * Safe with request data: an empty name, or any control character (CR, LF, NUL ...) in name or value,
  * drops the header (logged) instead of allowing header injection / response splitting.
  */
@@ -40,8 +45,24 @@ void res_json(Response *res, const char *body);
 /* Sends `len` raw bytes (may contain NULs) with an explicit content type. data may be NULL only if len is 0. */
 void res_send_bytes(Response *res, const char *content_type, const unsigned char *data, size_t len);
 
+/*
+ * Sends `body` by reference: only the head is built (in the arena); the connection pins `body` (one
+ * reference, taken here) and flush_connection writes it straight from body->data, never copying it.
+ * The caller keeps its own reference. Nothing is pinned for HEAD, a bodiless status, an empty body or a
+ * head that did not fit. The bytes must not change while any reference is held.
+ */
+void res_send_shared(Response *res, const char *content_type, SharedBody *body);
+
+/* A SharedBody of `len` bytes (data uninitialized) with refs == 1, or NULL on OOM / a len so large the
+ * header would overflow size_t. */
+SharedBody *shared_body_new(size_t len);
+
+/* Takes / drops one reference. Release frees the buffer when the count reaches 0; NULL is a no-op. */
+void shared_body_retain(SharedBody *body);
+void shared_body_release(SharedBody *body);
+
 /* Sets Location and sends a short text body. `status` should be 3xx; 0 means 302. A location containing
- * control characters is refused with 500. It is NOT checked against open redirects: validate untrusted targets. */
+ * control characters, or one that could not be stored (header table full), is refused with 500. It is NOT checked against open redirects: validate untrusted targets. */
 void res_redirect(Response *res, int status, const char *location);
 
 /*
@@ -60,21 +81,50 @@ void res_clear_cookie(Response *res, const char *name, const char *path);
 /*
  * Chunked streaming for bodies of unknown size. The first res_write (or res_end) commits the status
  * line and headers with Transfer-Encoding: chunked, so set headers and trailers-to-declare first.
- * Chunks accumulate in conn->out_buf (limit MAX_BODY_SIZE + header); the handler never blocks on
- * the socket. HEAD requests get the headers only. res_end writes the last chunk plus any trailers.
+ * Chunks accumulate in conn->out_buf (limit MAX_BODY_SIZE + header) and nothing is sent until the
+ * handler returns; the handler never blocks on the socket. For large or unbounded bodies use res_stream. HEAD requests get the headers only. res_end writes the last chunk plus any trailers.
  * res_set_trailer: same-name overwrites; Transfer-Encoding, Content-Length and Trailer are rejected;
- * MAX_RESPONSE_TRAILERS.
+ * MAX_RESPONSE_TRAILERS; names and values follow res_set_header's rules (value copied whole, never cut).
  */
 void res_write(Response *res, const char *data, size_t len);
 void res_set_trailer(Response *res, const char *name, const char *value);
 void res_end(Response *res);
 
 /*
- * Streams a file from disk in STREAM_CHUNK_SIZE pieces without loading it into memory. Sends
+ * Streams a file from disk without loading it into memory: sendfile(2) from the page cache (pread +
+ * write in STREAM_CHUNK_SIZE pieces where sendfile cannot serve the fd). Sends
  * Content-Length and `content_type`. Returns 0, or -1 if the file cannot be opened or is not a regular
  * file (nothing has been sent: respond with an error yourself). Caller must have validated `filepath`
  * (this does no traversal checking; use app_serve_static for untrusted paths).
  */
 int res_send_file(Response *res, const char *content_type, const char *filepath);
+
+/*
+ * Producer streaming for bodies too large or too slow to build inside the handler: large generated
+ * downloads, server-sent events, long-poll. Commits the status line and headers (Transfer-Encoding:
+ * chunked; set Content-Type etc. first) and returns; the event loop then calls
+ * `producer(writer, ctx)` every time the previous output has drained to the socket, so memory stays at
+ * one STREAM_CHUNK_SIZE buffer per connection however long the stream runs. See StreamProducer and the
+ * STREAM_* return values in app_types.h. The producer runs outside the handler: it must not touch the
+ * Request, Response or arena, only `ctx`. Trailers are not supported here (dropped, logged).
+ * Ownership: on 0 the engine owns ctx and calls ctx_free(ctx) exactly once (ctx_free may be NULL);
+ * a HEAD request gets the headers only and ctx_free runs before this returns. On -1 (headers already
+ * sent, NULL producer, or the head did not fit) nothing was taken: the caller still owns ctx.
+ */
+int res_stream(Response *res, StreamProducer producer, void *ctx, StreamCtxFree ctx_free);
+
+/*
+ * For use inside a StreamProducer: appends `len` bytes as one chunk. Returns 0, or -1 with nothing
+ * written when this turn's buffer is full (keep the data and return STREAM_MORE: you are called again
+ * once it drains). A single write up to STREAM_WRITE_MAX always fits an empty buffer; a larger one
+ * never fits, split it. len == 0 is a no-op (it would otherwise end the body).
+ */
+int stream_write(StreamWriter *out, const void *data, size_t len);
+
+/* Engine-internal: detaches a producer stream from conn and calls its ctx_free once. No-op if none. */
+void stream_release(Connection *conn);
+
+/* Engine-internal: drops conn's reference to its shared_body (res_send_shared) and clears it. No-op if none. */
+void shared_body_detach(Connection *conn);
 
 #endif /* RESPONSE_H */

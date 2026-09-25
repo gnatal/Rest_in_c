@@ -1,0 +1,74 @@
+# --- Build artifacts ---
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.out
+
+# --- Project binaries ---
+httpServer
+cexpress
+hello
+lib/json/json_test
+lib/middleware_test
+lib/router_test
+lib/http_parser_test
+lib/connection_test
+
+# --- Debug / profiling ---
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.gcno
+*.gcda
+*.gcov
+*.stackdump
+core
+core.*
+vgcore.*
+callgrind.out.*
+perf.data*
+
+# --- Build directories ---
+build/
+build-asan/
+out/
+bin/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Local env / logs ---
+*.log
+.env
+
+# --- Runtime test artifacts ---
+# handler_upload (app/handlers.c) writes uploaded files here for manual testing.
+temp.txt
+
+# --- Runtime data ---
+# db_open's default TODO_DB_PATH (app/main.c) - the Todo CRUD demo's SQLite
+# database and its WAL sidecar files (see lib/CLAUDE.md, "Worker lifecycle
+# hooks", for why WAL mode is on).
+todos.db
+todos.db-shm
+todos.db-wal
+*.db
+*.db-shm
+*.db-wal

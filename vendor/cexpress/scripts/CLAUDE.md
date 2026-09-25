@@ -1,0 +1,75 @@
+# scripts/ — performance & benchmarking tools
+
+## Architecture
+Utility and load-testing scripts used to benchmark latency, throughput, and memory stability of the server under high concurrency, and to keep the docs in sync with the code:
+- `wrk_create_todo.lua`: Lua request generator for `wrk` benchmarking `POST /api/todos` (Todo CRUD demo, `examples/todo_sqlite/`) - reads the `API_KEY` env var (`os.getenv`, falls back to the server's default) so the bearer token can be kept in sync with whatever the server under test is actually configured with, rather than every write 401ing against a mismatched hardcoded token.
+- `stress_test.sh`: End-to-end orchestration - `make demo` (builds `examples/todo_sqlite/cexpress_demo`), boots it in cluster mode (`WORKERS`, default 4) against a scratch SQLite file (`DB_PATH`, default `stress_todos.db`, deleted on exit via a `trap ... EXIT` alongside the server process itself), seeds 20 todos, then runs `wrk` in phases (`PHASES`, default `"ping churn read write"`). Tunable entirely via env vars (`PORT`/`WORKERS`/`THREADS`/`DURATION`/`CHURN_DURATION`/`CONNS`/`PHASES`/`DB_PATH`/`API_KEY`/`MEASURE_MEMORY`/`TIME_WAIT_MAX`/`TIME_WAIT_WAIT`) - no flags to remember. Phases:
+  - **`ping`** = `GET /ping` over keep-alive connections (fixed 4-byte reply defined inline in `examples/todo_sqlite/main.c`: no DB, no JSON, so it measures the engine's connection and request path alone). Runs first because it never touches the todo table.
+  - **`churn`** = the same endpoint with `Connection: close`, one new TCP connection per request, stressing accept/close. Each closed connection holds its client port in TIME_WAIT for 2 × MSL (30 s on macOS, `net.inet.tcp.msl` 15000), and macOS has 16,384 ephemeral ports (49152–65535); at ~20k connections/s they run out in about a second. MEASURED 2026-09-24: a 15 s churn run at 100 connections left 32,604 TIME_WAIT sockets (both loopback ends), and the next run got `connect` errors on all 1000 connections, or `wrk` aborted with `Can't assign requested address` (`EADDRNOTAVAIL`), which under `set -e` ended the whole script and looked like a server crash (the server itself shut down cleanly). Since then: churn runs for `CHURN_DURATION` (default `2s`, not `DURATION`); `wait_for_time_wait_drain` waits before each churn run and after the phase until fewer than `TIME_WAIT_MAX` (1000) remain, at most `TIME_WAIT_WAIT` (45) seconds (MEASURED ~31–35 s per drain); `time_wait_count` uses `ss` where present, else `netstat`. With `DURATION=3s` all four phases ran with 0 connect errors.
+  - **Failed `wrk` runs** no longer abort the script: `run_bench` records the exit status, prints a warning and continues; after the summary the script lists them and exits 1.
+  - **`read`** = `GET /` (Todo UI) and `GET /api/todos` (SQLite read path) at each concurrency level in `CONNS` (default `100 1000 5000`).
+  - **`write`** = `POST /api/todos` (SQLite write path, via `wrk_create_todo.lua`) at each level.
+  **Phase ordering matters**: reads run first, in their own pass, against the small seeded 20-row table - each `POST` benchmark inserts tens of thousands of rows, so interleaving read and write phases per concurrency tier made later read benchmarks measure against a table already grown past `TODO_LIST_MAX` (`examples/todo_sqlite/todo_types.h`), silently truncating every list response.
+- `docker_stress_test.sh`: the same idea as `stress_test.sh`, same phase/output/env-var pattern, but inside Docker to exercise the real Linux backends from a Mac: epoll by default, io_uring when `CEXPRESS_EVENT_LOOP=io_uring` is set (the script passes the variable through to the server container). Builds the server image (`Dockerfile`), starts it on a private Docker network with `--security-opt seccomp=unconfined --ulimit memlock=-1:-1` (needed for io_uring: Docker's default seccomp profile refuses `io_uring_setup` with `EPERM`), and runs `wrk` as its own container on that same network so benchmark traffic goes container-to-container, not through Docker Desktop's localhost proxy (only the readiness wait and seeding use the host port mapping). `wrk` itself runs from a locally-built image (`scripts/wrk.Dockerfile`, compiled from source at `docker build` time) rather than a pulled one - a pulled amd64-only image would run under QEMU emulation on Apple Silicon, making the load generator the bottleneck. Memory tracking sums `/proc/<pid>/status` VmRSS across every `cexpress_demo` process inside the server container via `docker exec` (PID 1 is always the master - the Dockerfile's `CMD` is exec-form, no shell wrapper), sampled every 500ms rather than `stress_test.sh`'s 250ms since each sample is a real process spawn through containerd/runc; there is no `/usr/bin/time -l` equivalent. **The first real run of this script (2026-09-22) found an io_uring bug** (`improvements.md`, `lib/CLAUDE.md` "Known gaps"): the io_uring backend closes every keep-alive connection after its first request, so every phase's numbers currently reflect that bug (`wrk` read-error counts exceeding the request count) until that bug is fixed - the script itself works correctly, it just faithfully exposes a real, previously-unverified server bug (nothing in this project had run on real Linux before this).
+- `check_docs.sh` (`make check-docs`): fails when a `lib/*.h` engine header declares a public function that `lib/API.md` never mentions, or when `lib/API.md` names a `name(` that no engine header or the vendored yyjson header declares. The yyjson API is not required to be listed (it has hundreds of functions); only the subset named in `API.md` is checked for typos. Keeps the LLM-facing API index from drifting.
+- `export_framework.sh` (`make export DEST=...`): copies `lib/` into another directory together with a standalone Makefile and README (see `../importing.md`). The generated Makefile lists the current sources (arena, yyjson, picohttpparser, the per-OS event loop: on Linux the dispatcher plus both the io_uring and epoll backends, or epoll only with `NO_URING=1`) and links `-luring` on Linux unless `NO_URING=1`. TLS is out of scope for this library (terminate it at a gateway/reverse proxy in front); the exported Makefile has no OpenSSL detection.
+
+## Known problems with `stress_test.sh`
+- **Changed 2026-09-23: failures are reported instead of silent.** Under `set -euo pipefail` the first failing
+  command used to exit through the `EXIT` trap, which stopped the server and deleted its log, so a run could end
+  right after "Seeding 20 todos" with only the workers' SIGTERM drain messages and no reason (seen once, not
+  reproduced: 6 startup+seed runs, one full run and 300 immediate post-startup POSTs all passed). Now: an `ERR` trap
+  names the failing line and command; on a non-zero exit the trap prints the last 40 lines of the server's stderr
+  before deleting it; the readiness wait fails explicitly if `GET /` never answers; and each seed `POST` must
+  return HTTP 201 (curl exit code and status are printed otherwise). The script also refuses to start when
+  something already listens on `PORT`: the engine sets `SO_REUSEPORT`, so a leftover server would bind alongside
+  the new one without error and silently take part of the run's connections.
+- **Fixed 2026-09-22: it used to start the demo from the repository root.** The demo resolves `public/` and the
+  default `todos.db` against its working directory, so from the root `app_serve_static` logged `root directory
+  "public" does not exist, not registered` and `GET /` answered `404` with a 9-byte body - the `GET / (Todo UI)`
+  rows in `stress_tests/full_run_output.txt` (captured 2026-09-21, before this fix) measure that 404, not the
+  6,481-byte page. Fix: the script still builds and does its own `cd` from the repository root (the Makefile paths
+  are root-relative), but now launches the server itself from a `DEMO_DIR="examples/todo_sqlite"` subshell
+  (`cd "$DEMO_DIR"; VAR=... exec ... ./cexpress_demo` - note the env-var assignments must precede `exec`, not
+  follow it as an argument to it, which silently fails with "exec: QUIET=1: not found" since `exec` has no such
+  option). `DB_PATH`'s pre-start and cleanup `rm -f` calls were updated to `$DEMO_DIR/$DB_PATH` to match, since the
+  scratch database now lives there too, not at the repository root. Verified: `PHASES=read DURATION=2s CONNS=10
+  MEASURE_MEMORY=0 ./scripts/stress_test.sh` now reports `GET / (Todo UI)` transferring ~6.27 KB/request
+  (850.83 MB / 135,773 requests), matching the real page size; `MEASURE_MEMORY=1` (the `time(1)`-wrapped,
+  `pgrep -P`-based master-PID resolution path) was also re-verified working end to end after the subshell change.
+- **Resolved 2026-09-24: the memory rows agree with independent measurements again.** The 2026-09-21 run reported
+  7-12 MB total at 5,000 connections while a direct measurement then put one worker at ~121 MB (25 KB/connection),
+  and `time -l` showed 0.01 s user CPU for a 230 s run. The engine has since moved to one arena and one receive
+  buffer per worker (~239 B per idle connection), so small totals are now expected. The full default run on
+  2026-09-24 cross-checks: sampler peak largest-single-process 4.2 MB vs `time -l` maximum RSS 4,407,296 bytes
+  (4.2 MB), and `time -l` user CPU 107 s over a 287 s run, so the `pgrep -P` master resolution is collecting the
+  real server.
+
+## Memory tracking (`stress_test.sh`, on by default, `MEASURE_MEMORY=0` to disable)
+Two independent measurements, because neither alone is accurate for a forked cluster:
+- **`/usr/bin/time -l`** (macOS; `-v` on Linux) wraps the server. Its rusage is collected by `wait4` on the master, which has reaped the workers, so `maximum resident set size` (bytes) is the **largest single process**, not the sum, while user/sys CPU time is summed across master and workers. `instructions retired`, `cycles elapsed` and `peak memory footprint` cover the master only and must not be quoted as whole-server figures. Under `time`, `$!` is `time`'s own PID, so the script resolves the real master with `pgrep -P` and signals that instead - `SIGTERM` sent to `time` itself would kill it before it prints the report. The server's stderr (and therefore `time`'s report, and any `terminated by signal` worker-crash messages from `cluster.c`) is redirected to a temp log printed at the end; the script reports the crash count from it.
+- **A `ps`-based sampler** (every 250 ms, per benchmark) sums RSS across the master and all its children and records the peak total plus the peak single process. This is the whole-server number; the single-process peak should agree with `time -l`'s maximum RSS, which is the cross-check (it did not in the 2026-09-21 run, see above).
+- **RSS is a high-water mark**: the allocator does not return freed pages to the OS, so a later benchmark inherits memory grown by an earlier, higher-connection one. Summed RSS also counts shared pages (binary, libc, SQLite, fork copy-on-write) once per process, so totals overstate physical memory.
+- **Per-connection cost** (direct measurement, macOS, one worker, N idle keep-alive connections opened from a script, RSS from `ps`): 5,000 connections took about 121 MB, about 25 KB each, whether idle or after one `GET /ping` each. That is the 8 KiB `in_buf` plus the touched part of the 64 KiB per-connection arena (`../tradeoffs.md`). The earlier engine measured about 7 KB per connection.
+- Known open item: at 5,000 connections `wrk` reports read errors in longer runs; seen on 2026-09-21 in `ping` (2,219 / 1,624 errors), `GET /` and `POST`, and on 2026-09-24 in every 5,000-connection row (`ping` 1,344, `GET /` 655, `GET /api/todos` 994, `POST` 5,283 plus 3,008 timeouts at 307 ms average latency); no worker crashes, cause unidentified.
+
+## Recorded runs
+- **2026-09-24, `stress_test.sh` defaults, macOS M3 Pro** (host busy: load average 7-8 before the run, `sysmond` ~76% CPU): exit 0, 0 connect errors, 0 worker crashes. keep-alive `/ping` 158,730 / 181,403 / 172,327 req/s at 100 / 1,000 / 5,000 connections (short re-runs: 175-180k / 191-193k); churn 35,445 / 23,627 / 22,542 conn/s (2 s rows; 13-19k TIME_WAIT left after each, drained in 31-32 s); `GET /` 117,244 / 118,832 / 110,533; `GET /api/todos` 154,644 / 169,478 / 163,515 (about the `/ping` rate, so client-bound); `POST` 20,818 / 19,741 / 19,748. Memory: idle 13.0 MB total, peak 18.3 MB total, 4.2 MB largest process. These `/ping` numbers are below the 250-257k of 21-23 Sep on the same machine; the host load is the likely cause, not verified by an A/B run.
+- **2026-09-24, `docker_stress_test.sh` defaults (epoll)**: exit 0, 0 worker crashes. `/ping` 240,019 / 251,306 req/s at 100 / 1,000 connections; churn 47,132 / 43,806 conn/s; `GET /` 110,212 / 105,454; `GET /api/todos` 72,901 / 68,206; `POST` 7,891 / 7,665 (240 timeouts at 1,000). Memory 11.2-11.8 MB total, 2.6 MB largest process. On Linux, SQLite reads and writes are well below macOS while `/ping` is higher; not investigated (the container's filesystem for the database file is one candidate).
+
+## Execution & Concurrency
+- Designed to test keep-alive connection reuse, routing/middleware overhead, and SQLite read/write throughput under high concurrent connection loads (e.g. 5,000 connections over 8 threads) and multi-process cluster contention (`stress_test.sh`'s default `WORKERS=4` is the scenario `lib/CLAUDE.md`'s "Behavior reference, Workers and fork" fork-safety fix specifically has to hold up under - multiple worker processes hitting the same SQLite file concurrently).
+- Benchmarking should run against a release-optimized build with keep-alive active to verify zero TCP round-trip latency anomalies (avoiding Nagle/delayed ACK interaction). The demo sets `TCP_NODELAY` on accepted sockets.
+- `wrk` runs on the same machine as the server in every recorded run, so both compete for the same cores; on the M3 Pro a single worker reached 221k `/ping` req/s against 250k for four workers, so those runs are client-bound. Only compare numbers taken the same way.
+- `stress_test.sh` requires `wrk` on `PATH` (`brew install wrk` / `apt install wrk`) and exits early with a clear message if it's missing.
+
+- Equivalent manual commands (what `stress_test.sh` automates; run them from `examples/todo_sqlite/` after `make demo` from the repository root):
+```
+QUIET=1 WORKERS=4 ./cexpress_demo
+wrk -t8 -c5000 -d15s http://127.0.0.1:8080/api/todos
+wrk -t8 -c1000 -d15s http://127.0.0.1:8080/api/todos
+wrk -t8 -c100 -d15s http://127.0.0.1:8080/api/todos
+wrk -t8 -c1000 -d15s http://127.0.0.1:8080/ping                              # keep-alive connections
+wrk -t8 -c1000 -d15s -H "Connection: close" http://127.0.0.1:8080/ping       # connection churn
+API_KEY=my-secret-api-key wrk -t8 -c100 -d15s -s ../../scripts/wrk_create_todo.lua http://127.0.0.1:8080/api/todos
+```

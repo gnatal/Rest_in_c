@@ -1,22 +1,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include "http_parser.h"
 #include "router.h"
 #include "middleware.h"
 
 void app_init(App *app) {
     app->config.port = DEFAULT_PORT;
     app->config.workers = 1;
-    app->config.tls_enabled = 0;
-    app->config.tls_cert_file[0] = '\0';
-    app->config.tls_key_file[0] = '\0';
-    app->ssl_ctx = NULL;
-    app->route_count = 0;
+    app->config.bind_address = NULL; /* every IPv4 interface */
+    app->config.max_connections = DEFAULT_MAX_CONNECTIONS;
+    app->config.max_buffered_bytes = DEFAULT_MAX_BUFFERED_BYTES;
+    app->open_connections = 0;
+    app->buffered_bytes = 0;
+    /* Best effort: a failed open just means EMFILE gets the pre-existing silent behavior -
+     * see App.spare_fd. */
+    app->spare_fd = open("/dev/null", O_RDONLY);
+    app->method_tree_count = 0;
     app->middleware_count = 0;
+    app->body_limit_count = 0;
     app->error_handler = NULL;
     app->worker_init_hook_count = 0;
     app->server_fd = -1;
+    app->accept_via_fd_passing = 0;
+#if defined(__linux__)
+    app->ring = NULL; /* widest union member; which one is live is decided by loop_ops */
+#else
     app->loop_fd = -1;
+#endif
+    app->loop_ops = NULL;
+    app->poll_regs = NULL;
+    app->poll_regs_cap = 0;
     app->timer_idle_fd = -1;
     app->timer_shutdown_fd = -1;
     app->signal_fd = -1;
@@ -33,27 +48,59 @@ void app_init(App *app) {
         exit(EXIT_FAILURE);
     }
     app->connections_cap = INITIAL_CONNECTION_TABLE_CAP;
+
+    /* one shared arena for the whole worker process (every Connection.arena it creates just points
+     * here), not one per connection - see app_types.h's App.arena and Connection.arena comments. Same
+     * failure convention as the calloc above: the server can't run without this either. */
+    char *arena_buf = malloc(ARENA_SIZE);
+    if (arena_buf == NULL) {
+        perror("app_init: malloc (arena)");
+        exit(EXIT_FAILURE);
+    }
+    arena_init(&app->arena, arena_buf, ARENA_SIZE);
+
+    /* the one receive buffer idle connections borrow (App.read_buf), instead of each owning one. */
+    app->read_buf = malloc(BUF_SIZE);
+    if (app->read_buf == NULL) {
+        perror("app_init: malloc (read_buf)");
+        exit(EXIT_FAILURE);
+    }
 }
 
 /* Shared fill logic for one route slot, used by both app_add_route_mw and
  * router_add_route_mw - an App and a Router register routes identically,
- * they just land in different fixed Route[MAX_ROUTES] arrays. */
-static void fill_route(Route *route, const char *method, const char *path, Handler handler,
-                        const Middleware *middlewares, int middleware_count) {
+ * they just land in different fixed Route[MAX_ROUTES] arrays.
+ * a method/path that doesn't fit its fixed slot is rejected outright (0/-1), not silently
+ * truncated by strncpy - a truncated pattern used to register a different, shorter route than the
+ * caller asked for with no indication anything was wrong. Returns 0 on success, -1 (route left
+ * untouched, nothing registered) if either is too long. */
+static int fill_route(Route *route, const char *method, const char *path, Handler handler,
+                       const Middleware *middlewares, int middleware_count) {
+    if (strlen(method) >= sizeof(route->method)) {
+        fprintf(stderr, "route registration: method \"%s\" exceeds %zu chars, route \"%s\" not registered\n",
+                method, sizeof(route->method) - 1, path);
+        return -1;
+    }
+    if (strlen(path) >= sizeof(route->path)) {
+        fprintf(stderr, "route registration: path \"%s\" exceeds %zu chars, route not registered\n",
+                path, sizeof(route->path) - 1);
+        return -1;
+    }
     strncpy(route->method, method, sizeof(route->method) - 1);
     route->method[sizeof(route->method) - 1] = '\0';
     strncpy(route->path, path, sizeof(route->path) - 1);
     route->path[sizeof(route->path) - 1] = '\0';
     route->handler = handler;
+    route->has_params = strchr(route->path, ':') != NULL;
 
     /* Every route filled through here is an ordinary (non-static) route -
-     * only app_serve_static fills a Route's static_root directly, bypassing
-     * fill_route entirely. Route slots aren't zero-initialized before this
-     * runs (App/Router are plain structs, not calloc'd), so without this an
-     * ordinary route could inherit whatever stack garbage was previously in
-     * this slot's static_root and be mistaken for a static mount by
-     * dispatch()/chain_next() (middleware.c). */
-    route->static_root[0] = '\0';
+     * only app_serve_static sets static_root, after fill_route returns.
+     * Route slots aren't zero-initialized before this runs (App/Router are
+     * plain structs, not calloc'd), so without this an ordinary route could
+     * inherit whatever garbage was previously in this slot and be mistaken
+     * for a static mount by chain_next() (middleware.c) - or have it passed
+     * to free() by route_free. */
+    route->static_root = NULL;
 
     if (middleware_count > MAX_ROUTE_MIDDLEWARES) {
         fprintf(stderr, "route registration: MAX_ROUTE_MIDDLEWARES exceeded, truncating\n");
@@ -63,6 +110,39 @@ static void fill_route(Route *route, const char *method, const char *path, Handl
         route->middlewares[i] = middlewares[i];
     }
     route->middleware_count = middleware_count;
+    return 0;
+}
+
+static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route);
+
+/* Frees a malloc'd Route and the static_root it owns (NULL for ordinary routes). Every path that
+ * drops a heap Route - registration failure, duplicate, app_free_routes - goes through here. Never
+ * called on a Router's fixed routes[] slots: those never own a static_root. */
+static void route_free(Route *route) {
+    free(route->static_root);
+    free(route);
+}
+
+static void app_insert_route_struct(App *app, Route *route) {
+    MethodTree *mt = NULL;
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (strcmp(app->method_trees[i].method, route->method) == 0) {
+            mt = &app->method_trees[i];
+            break;
+        }
+    }
+    if (!mt) {
+        if (app->method_tree_count >= 16) {
+            fprintf(stderr, "app_add_route: max method trees exceeded\n");
+            route_free(route);
+            return;
+        }
+        mt = &app->method_trees[app->method_tree_count++];
+        strncpy(mt->method, route->method, sizeof(mt->method) - 1);
+        mt->method[sizeof(mt->method) - 1] = '\0';
+        mt->tree = NULL;
+    }
+    tree_insert(&mt->tree, route->path, route);
 }
 
 void app_add_route(App *app, const char *method, const char *path, Handler handler) {
@@ -71,11 +151,16 @@ void app_add_route(App *app, const char *method, const char *path, Handler handl
 
 void app_add_route_mw(App *app, const char *method, const char *path, Handler handler,
                        const Middleware *middlewares, int middleware_count) {
-    if (app->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "app_add_route: MAX_ROUTES exceeded\n");
+    Route *route = malloc(sizeof(Route));
+    if (route == NULL) {
+        fprintf(stderr, "app_add_route: out of memory, route \"%s %s\" not registered\n", method, path);
         return;
     }
-    fill_route(&app->routes[app->route_count++], method, path, handler, middlewares, middleware_count);
+    if (fill_route(route, method, path, handler, middlewares, middleware_count) != 0) {
+        free(route);
+        return;
+    }
+    app_insert_route_struct(app, route);
 }
 
 void app_get(App *app, const char *path, Handler handler) {
@@ -152,11 +237,15 @@ void router_add_route(Router *router, const char *method, const char *path, Hand
 
 void router_add_route_mw(Router *router, const char *method, const char *path, Handler handler,
                           const Middleware *middlewares, int middleware_count) {
-    if (router->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "router_add_route: MAX_ROUTES exceeded\n");
+    if (router->route_count >= MAX_ROUTER_ROUTES) {
+        fprintf(stderr, "router_add_route: MAX_ROUTER_ROUTES exceeded\n");
         return;
     }
-    fill_route(&router->routes[router->route_count++], method, path, handler, middlewares, middleware_count);
+    if (fill_route(&router->routes[router->route_count], method, path, handler,
+                    middlewares, middleware_count) != 0) {
+        return; /* slot left unfilled and uncounted - nothing to free, it's part of the fixed array */
+    }
+    router->route_count++;
 }
 
 void router_get(Router *router, const char *path, Handler handler) {
@@ -230,25 +319,6 @@ void router_use(Router *router, Middleware mw) {
     router->middlewares[router->middleware_count++] = mw;
 }
 
-/* Normalizes a mount-point prefix (app_mount, app_serve_static): "" or "/"
- * alone means an unscoped/root mount - both app_use_prefix and
- * build_mounted_path below treat "" as "no prefix to add/match on". A
- * trailing slash (e.g. "/api/") is stripped so concatenating a route's own
- * leading-slash path doesn't double up ("/api//users"). Shared by both
- * mounting entry points rather than duplicated, since the rule is identical. */
-static void normalize_mount_prefix(const char *prefix, char *out, size_t out_size) {
-    if (prefix == NULL || prefix[0] == '\0' || strcmp(prefix, "/") == 0) {
-        out[0] = '\0';
-        return;
-    }
-    strncpy(out, prefix, out_size - 1);
-    out[out_size - 1] = '\0';
-    const size_t len = strlen(out);
-    if (len > 0 && out[len - 1] == '/') {
-        out[len - 1] = '\0';
-    }
-}
-
 /* Builds the mounted path for one router route: prefix + route->path, except
  * a router route registered at "/" (the router's own root) mounts at the
  * prefix itself rather than "prefix/" - so router_get(router, "/", h) mounted
@@ -264,7 +334,7 @@ static void build_mounted_path(char *out, size_t out_size, const char *prefix, c
 
 void app_mount(App *app, const char *prefix, const Router *router) {
     char normalized_prefix[128];
-    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
+    path_normalize_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
     for (int i = 0; i < router->middleware_count; i++) {
         app_use_prefix(app, normalized_prefix, router->middlewares[i]);
@@ -280,17 +350,6 @@ void app_mount(App *app, const char *prefix, const Router *router) {
 }
 
 void app_serve_static(App *app, const char *prefix, const char *root_dir) {
-    if (app->route_count >= MAX_ROUTES) {
-        fprintf(stderr, "app_serve_static: MAX_ROUTES exceeded\n");
-        return;
-    }
-
-    /* Canonicalize root_dir once, at registration time, rather than per
-     * request - static_serve_file (lib/static.c) compares every resolved
-     * request path against this canonical root to catch a symlink inside
-     * root_dir escaping it (realpath also requires the path to already
-     * exist, which doubles as a deny-by-default check: refuse to register a
-     * mount pointing at a directory that isn't there). */
     char canonical_root[PATH_MAX];
     if (realpath(root_dir, canonical_root) == NULL) {
         fprintf(stderr, "app_serve_static: root directory \"%s\" does not exist, not registered\n", root_dir);
@@ -298,24 +357,76 @@ void app_serve_static(App *app, const char *prefix, const char *root_dir) {
     }
 
     char normalized_prefix[128];
-    normalize_mount_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
+    path_normalize_prefix(prefix, normalized_prefix, sizeof(normalized_prefix));
 
-    /* Always a trailing-wildcard pattern (see match_path, "Behavior reference, Routing",
-     * lib/CLAUDE.md) so this mount answers everything under the prefix - a
-     * request for the prefix itself, with nothing after it, simply doesn't
-     * match (same as any other trailing "*" route) and falls through to the
-     * app's ordinary 404/405 handling. */
-    Route *route = &app->routes[app->route_count++];
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "%s/*", normalized_prefix);
-    fill_route(route, "GET", pattern, NULL, NULL, 0);
-
-    size_t root_len = strlen(canonical_root);
-    if (root_len >= sizeof(route->static_root)) {
-        root_len = sizeof(route->static_root) - 1;
+    
+    Route *route = malloc(sizeof(Route));
+    if (route == NULL) {
+        fprintf(stderr, "app_serve_static: out of memory, \"%s\" not registered\n", root_dir);
+        return;
     }
-    memcpy(route->static_root, canonical_root, root_len);
-    route->static_root[root_len] = '\0';
+    if (fill_route(route, "GET", pattern, NULL, NULL, 0) != 0) {
+        free(route);
+        return;
+    }
+
+    /* sized to the canonical root, not PATH_MAX. Owned by the Route from here on - route_free
+     * releases it on every path, including tree_insert's own failures and duplicates. */
+    const size_t root_size = strlen(canonical_root) + 1;
+    route->static_root = malloc(root_size);
+    if (route->static_root == NULL) {
+        fprintf(stderr, "app_serve_static: out of memory, \"%s\" not registered\n", root_dir);
+        free(route);
+        return;
+    }
+    memcpy(route->static_root, canonical_root, root_size);
+
+    app_insert_route_struct(app, route);
+}
+
+void app_use_body_limit(App *app, const char *prefix, size_t max_bytes) {
+    if (app->body_limit_count >= MAX_BODY_LIMITS) {
+        fprintf(stderr, "app_use_body_limit: MAX_BODY_LIMITS exceeded\n");
+        return;
+    }
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    if (max_bytes > MAX_BODY_SIZE) {
+        fprintf(stderr, "app_use_body_limit: %zu exceeds MAX_BODY_SIZE, clamped to %d\n",
+                max_bytes, MAX_BODY_SIZE);
+        max_bytes = MAX_BODY_SIZE;
+    }
+    BodyLimitEntry *entry = &app->body_limits[app->body_limit_count++];
+    path_normalize_prefix(prefix, entry->prefix, sizeof(entry->prefix));
+    entry->max_bytes = max_bytes;
+}
+
+size_t app_body_limit_for_path(const App *app, const char *path) {
+    size_t best_len = 0;
+    size_t limit = MAX_BODY_SIZE;
+    for (int i = 0; i < app->body_limit_count; i++) {
+        const BodyLimitEntry *entry = &app->body_limits[i];
+        if (!path_prefix_matches(entry->prefix, path)) {
+            continue;
+        }
+        const size_t entry_len = strlen(entry->prefix);
+        if (entry_len >= best_len) {
+            best_len = entry_len;
+            limit = entry->max_bytes;
+        }
+    }
+    return limit;
+}
+
+size_t app_body_limit_for_target(const App *app, const char *target, const size_t target_len) {
+    char path[sizeof(((Request *)0)->path)];
+    if (request_target_path(target, target_len, path, sizeof(path)) != 0) {
+        return MAX_BODY_SIZE; /* the full parse rejects this target (400/414) - no route to scope to */
+    }
+    return app_body_limit_for_path(app, path);
 }
 
 /* Advances *cursor past '/' separators and returns the next path segment
@@ -388,31 +499,230 @@ int match_path(const char *pattern, const char *path, Request *req) {
     return pattern_seg == NULL && path_seg == NULL;
 }
 
-const Route *match_route(const App *app, Request *req) {
-    for (int i = 0; i < app->route_count; i++) {
-        const Route *route = &app->routes[i];
-        if (strcmp(route->method, req->method) != 0) {
-            continue;
+/* Total order over segment bytes (short-lexicographic: shared prefix compares first, shorter wins
+ * ties) so children can be kept sorted and searched with binary search instead of a linear scan
+ * (was O(siblings) per segment, 8.4 us at 5,000 siblings). */
+static int compare_seg(const char *a, size_t a_len, const char *b, size_t b_len) {
+    size_t min_len = a_len < b_len ? a_len : b_len;
+    int c = memcmp(a, b, min_len);
+    if (c != 0) return c;
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}
+
+/* Binary search current->children (kept sorted by compare_seg) for seg. Returns the index of an
+ * exact match via *out_idx and 1, or the sorted insertion point via *out_idx and 0. */
+static int find_child(PatriciaNode *const *children, int child_count, const char *seg, size_t seg_len,
+                       int *out_idx) {
+    int low = 0, high = child_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        int c = compare_seg(seg, seg_len, children[mid]->prefix, (size_t)children[mid]->prefix_len);
+        if (c == 0) {
+            *out_idx = mid;
+            return 1;
         }
-        if (match_path(route->path, req->path, req)) {
-            return route;
+        if (c < 0) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    *out_idx = low;
+    return 0;
+}
+
+/* returns NULL (nothing partially allocated - a failed prefix malloc frees the node before
+ * returning) on either allocation failing, instead of handing the caller a node with a dangling or
+ * missing prefix. */
+static PatriciaNode *create_patricia_node(const char *prefix, size_t prefix_len, NodeType type) {
+    PatriciaNode *n = calloc(1, sizeof(PatriciaNode));
+    if (n == NULL) {
+        return NULL;
+    }
+    if (prefix_len > 0) {
+        n->prefix = malloc(prefix_len + 1);
+        if (n->prefix == NULL) {
+            free(n);
+            return NULL;
+        }
+        memcpy(n->prefix, prefix, prefix_len);
+        n->prefix[prefix_len] = '\0';
+        n->prefix_len = (int)prefix_len;
+    }
+    n->type = type;
+    return n;
+}
+
+/* every node allocation and the children realloc are checked; on failure this frees `route` (route_free)
+ * (never inserted) and logs, rather than dereferencing a NULL node or leaking `route`. Any tree
+ * structure already linked in before the failing allocation is harmless - a PatriciaNode with no
+ * route is already a normal, valid internal node, and it's still shared by any other route that
+ * needs that same path prefix. */
+static void tree_insert(PatriciaNode **root_ptr, const char *path, Route *route) {
+    if (*root_ptr == NULL) {
+        *root_ptr = create_patricia_node("", 0, NODE_STATIC);
+        if (*root_ptr == NULL) {
+            fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+            route_free(route);
+            return;
         }
     }
 
-    /* Auto-HEAD-from-GET: only reached when no explicit HEAD route matched
-     * above. HTTP requires a HEAD response to look like the equivalent GET
-     * response minus the body (RFC 7231 4.3.2) - falling back to the GET
-     * route here means its handler runs normally (building a body as usual),
-     * and Response.is_head_request (set by handle_readable, connection.c)
-     * is what actually keeps that body off the wire (response.c). */
-    if (strcmp(req->method, "HEAD") == 0) {
-        for (int i = 0; i < app->route_count; i++) {
-            const Route *route = &app->routes[i];
-            if (strcmp(route->method, "GET") != 0) {
-                continue;
+    PatriciaNode *current = *root_ptr;
+    const char *cursor = path;
+    size_t seg_len;
+    const char *seg = next_segment(&cursor, &seg_len);
+
+    while (seg != NULL) {
+        NodeType type = NODE_STATIC;
+        if (seg_len == 1 && seg[0] == '*') {
+            const char *lookahead = cursor;
+            size_t next_len;
+            if (next_segment(&lookahead, &next_len) == NULL) {
+                type = NODE_CATCH_ALL;
+            } else {
+                type = NODE_PARAM;
             }
-            if (match_path(route->path, req->path, req)) {
-                return route;
+        } else if (seg[0] == ':') {
+            type = NODE_PARAM;
+        }
+
+        PatriciaNode *next_node = NULL;
+
+        if (type == NODE_STATIC) {
+            int idx;
+            if (find_child(current->children, current->child_count, seg, seg_len, &idx)) {
+                next_node = current->children[idx];
+            } else {
+                if (current->child_count >= current->child_cap) {
+                    int new_cap = current->child_cap == 0 ? 4 : current->child_cap * 2;
+                    PatriciaNode **new_children = realloc(current->children, (size_t)new_cap * sizeof(PatriciaNode *));
+                    if (new_children == NULL) {
+                        fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                        route_free(route);
+                        return;
+                    }
+                    current->children = new_children;
+                    current->child_cap = new_cap;
+                }
+                next_node = create_patricia_node(seg, seg_len, NODE_STATIC);
+                if (next_node == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    route_free(route);
+                    return;
+                }
+                memmove(&current->children[idx + 1], &current->children[idx],
+                        (size_t)(current->child_count - idx) * sizeof(PatriciaNode *));
+                current->children[idx] = next_node;
+                current->child_count++;
+            }
+        } else if (type == NODE_PARAM) {
+            if (!current->param_child) {
+                if (seg[0] == ':') {
+                    current->param_child = create_patricia_node(seg + 1, seg_len - 1, NODE_PARAM);
+                } else {
+                    current->param_child = create_patricia_node("*", 1, NODE_PARAM);
+                }
+                if (current->param_child == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    route_free(route);
+                    return;
+                }
+            }
+            next_node = current->param_child;
+        } else if (type == NODE_CATCH_ALL) {
+            if (!current->catch_all_child) {
+                current->catch_all_child = create_patricia_node("*", 1, NODE_CATCH_ALL);
+                if (current->catch_all_child == NULL) {
+                    fprintf(stderr, "route registration: out of memory, route \"%s\" not registered\n", path);
+                    route_free(route);
+                    return;
+                }
+            }
+            next_node = current->catch_all_child;
+        }
+
+        current = next_node;
+        seg = next_segment(&cursor, &seg_len);
+    }
+
+    if (!current->route) {
+        current->route = route;
+    } else {
+        fprintf(stderr, "Warning: Route %s already registered, ignoring duplicate\n", path);
+        route_free(route);
+    }
+}
+
+/* the walk only finds the Route; it captures nothing. A param node is shared by every route with a
+ * parameter (or mid-pattern '*') at that position, so its prefix is only the FIRST registrant's name -
+ * naming captures from it returned NULL for "/orders/:oid/notes" registered after "/orders/:id/items".
+ * match_route fills names/values afterwards from the matched Route's own pattern (fill_route_params). */
+static const Route *tree_search_recursive(const PatriciaNode *node, const char *cursor, const char *seg, size_t seg_len) {
+    if (seg == NULL) {
+        return node->route;
+    }
+
+    const char *next_cursor = cursor;
+    size_t next_seg_len = 0;
+    const char *next_seg = next_segment(&next_cursor, &next_seg_len);
+
+    int idx;
+    if (find_child(node->children, node->child_count, seg, seg_len, &idx)) {
+        const Route *res = tree_search_recursive(node->children[idx], next_cursor, next_seg, next_seg_len);
+        if (res) return res;
+    }
+
+    if (node->param_child) {
+        const Route *res = tree_search_recursive(node->param_child, next_cursor, next_seg, next_seg_len);
+        if (res) return res;
+    }
+
+    if (node->catch_all_child) {
+        return node->catch_all_child->route;
+    }
+
+    return NULL;
+}
+
+static const Route *tree_search(const PatriciaNode *node, const char *path) {
+    if (!node) return NULL;
+    const char *cursor = path;
+    size_t seg_len = 0;
+    const char *seg = next_segment(&cursor, &seg_len);
+    return tree_search_recursive(node, cursor, seg, seg_len);
+}
+
+/* names AND values come from the matched route's own pattern, so every route sees its own ':name's
+ * regardless of what an earlier route called the shared tree position. The tree already proved the
+ * match, so match_path cannot fail here; routes without ':' skip the second walk entirely. */
+static const Route *fill_route_params(const Route *route, Request *req) {
+    req->param_count = 0;
+    if (route != NULL && route->has_params) {
+        match_path(route->path, req->path, req);
+    }
+    return route;
+}
+
+const Route *match_route(const App *app, Request *req) {
+    req->param_count = 0;
+
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (strcmp(app->method_trees[i].method, req->method) == 0) {
+            const Route *route = tree_search(app->method_trees[i].tree, req->path);
+            if (route) return fill_route_params(route, req);
+            break;
+        }
+    }
+
+    if (strcmp(req->method, "HEAD") == 0) {
+        for (int i = 0; i < app->method_tree_count; i++) {
+            if (strcmp(app->method_trees[i].method, "GET") == 0) {
+                const Route *route = tree_search(app->method_trees[i].tree, req->path);
+                if (route) return fill_route_params(route, req);
+                break;
             }
         }
     }
@@ -420,38 +730,46 @@ const Route *match_route(const App *app, Request *req) {
     return NULL;
 }
 
+static int tree_has_match(const PatriciaNode *node, const char *path) {
+    return tree_search(node, path) != NULL;
+}
+
 int match_route_allowed_methods(const App *app, const Request *req, char *allowed, size_t allowed_size) {
-    char seen[MAX_ROUTES][8];
     int seen_count = 0;
     allowed[0] = '\0';
-
-    for (int i = 0; i < app->route_count; i++) {
-        const Route *route = &app->routes[i];
-        if (!match_path(route->path, req->path, NULL)) {
-            continue;
-        }
-
-        int already_seen = 0;
-        for (int j = 0; j < seen_count; j++) {
-            if (strcmp(seen[j], route->method) == 0) {
-                already_seen = 1;
-                break;
+    
+    for (int i = 0; i < app->method_tree_count; i++) {
+        if (tree_has_match(app->method_trees[i].tree, req->path)) {
+            if (allowed[0] != '\0') {
+                strncat(allowed, ", ", allowed_size - strlen(allowed) - 1);
             }
+            strncat(allowed, app->method_trees[i].method, allowed_size - strlen(allowed) - 1);
+            seen_count++;
         }
-        if (already_seen) {
-            continue;
-        }
-        strncpy(seen[seen_count], route->method, sizeof(seen[0]) - 1);
-        seen[seen_count][sizeof(seen[0]) - 1] = '\0';
-        seen_count++;
-
-        if (allowed[0] != '\0') {
-            strncat(allowed, ", ", allowed_size - strlen(allowed) - 1);
-        }
-        strncat(allowed, route->method, allowed_size - strlen(allowed) - 1);
     }
-
+    
     return seen_count;
+}
+
+void free_patricia_tree(PatriciaNode *node) {
+    if (!node) return;
+    for (int i = 0; i < node->child_count; i++) {
+        free_patricia_tree(node->children[i]);
+    }
+    if (node->children) free(node->children);
+    if (node->param_child) free_patricia_tree(node->param_child);
+    if (node->catch_all_child) free_patricia_tree(node->catch_all_child);
+    if (node->prefix) free(node->prefix);
+    if (node->route) route_free(node->route);
+    free(node);
+}
+
+void app_free_routes(App *app) {
+    for (int i = 0; i < app->method_tree_count; i++) {
+        free_patricia_tree(app->method_trees[i].tree);
+        app->method_trees[i].tree = NULL;
+    }
+    app->method_tree_count = 0;
 }
 
 const char *req_get_param(const Request *req, const char *name) {
@@ -461,22 +779,5 @@ const char *req_get_param(const Request *req, const char *name) {
         }
     }
     return NULL;
-}
-
-int app_enable_tls(App *app, const char *cert_file, const char *key_file) {
-    if (app == NULL || cert_file == NULL || key_file == NULL ||
-        cert_file[0] == '\0' || key_file[0] == '\0') {
-        return -1;
-    }
-    if (strlen(cert_file) >= sizeof(app->config.tls_cert_file) ||
-        strlen(key_file) >= sizeof(app->config.tls_key_file)) {
-        return -1;
-    }
-    strncpy(app->config.tls_cert_file, cert_file, sizeof(app->config.tls_cert_file) - 1);
-    app->config.tls_cert_file[sizeof(app->config.tls_cert_file) - 1] = '\0';
-    strncpy(app->config.tls_key_file, key_file, sizeof(app->config.tls_key_file) - 1);
-    app->config.tls_key_file[sizeof(app->config.tls_key_file) - 1] = '\0';
-    app->config.tls_enabled = 1;
-    return 0;
 }
 
