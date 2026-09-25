@@ -169,6 +169,32 @@ int db_get_user_by_id(int id, User *out_user) {
     return 0;
 }
 
+int db_update_user(int id, const char *email, const char *username, const char *password_hash, const char *image, const char *bio, User *out_user) {
+    const char *sql = "UPDATE users SET "
+                      "email = COALESCE(?, email), "
+                      "username = COALESCE(?, username), "
+                      "password_hash = COALESCE(?, password_hash), "
+                      "image = COALESCE(?, image), "
+                      "bio = COALESCE(?, bio) "
+                      "WHERE id = ?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+
+    if (email) sqlite3_bind_text(stmt, 1, email, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 1);
+    if (username) sqlite3_bind_text(stmt, 2, username, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 2);
+    if (password_hash) sqlite3_bind_text(stmt, 3, password_hash, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 3);
+    if (image) sqlite3_bind_text(stmt, 4, image, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 4);
+    if (bio) sqlite3_bind_text(stmt, 5, bio, -1, SQLITE_STATIC); else sqlite3_bind_null(stmt, 5);
+    
+    sqlite3_bind_int(stmt, 6, id);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) return -1;
+    return db_get_user_by_id(id, out_user);
+}
+
 static void populate_article(sqlite3_stmt *stmt, Article *article) {
     article->id = sqlite3_column_int(stmt, 0);
     const char *slug = (const char *)sqlite3_column_text(stmt, 1);
@@ -238,6 +264,134 @@ int db_update_article(const char *slug, const char *title, const char *new_slug,
     if (rc != SQLITE_DONE) return -1;
     
     return db_get_article_by_slug(new_slug ? new_slug : slug, out_article);
+}
+int db_get_articles(const char *tag, const char *author, const char *favorited, int limit, int offset, Article **out_articles, int *out_count, int *out_total) {
+    char base_where[512] = "WHERE 1=1 ";
+    if (tag && tag[0]) strcat(base_where, "AND a.id IN (SELECT at.article_id FROM article_tags at JOIN tags t ON at.tag_id = t.id WHERE t.name = ?) ");
+    if (author && author[0]) strcat(base_where, "AND a.author_id IN (SELECT id FROM users WHERE username = ?) ");
+    if (favorited && favorited[0]) strcat(base_where, "AND a.id IN (SELECT f.article_id FROM favorites f JOIN users fu ON f.user_id = fu.id WHERE fu.username = ?) ");
+    
+    char count_sql[1024];
+    snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM articles a %s", base_where);
+    
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db_conn, count_sql, -1, &stmt, NULL);
+    int bind_idx = 1;
+    if (tag && tag[0]) sqlite3_bind_text(stmt, bind_idx++, tag, -1, SQLITE_STATIC);
+    if (author && author[0]) sqlite3_bind_text(stmt, bind_idx++, author, -1, SQLITE_STATIC);
+    if (favorited && favorited[0]) sqlite3_bind_text(stmt, bind_idx++, favorited, -1, SQLITE_STATIC);
+    
+    if (sqlite3_step(stmt) == SQLITE_ROW) *out_total = sqlite3_column_int(stmt, 0);
+    else *out_total = 0;
+    sqlite3_finalize(stmt);
+    
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT id, slug, title, description, body, created_at, updated_at, author_id FROM articles a %s ORDER BY created_at DESC LIMIT ? OFFSET ?", base_where);
+    
+    sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    bind_idx = 1;
+    if (tag && tag[0]) sqlite3_bind_text(stmt, bind_idx++, tag, -1, SQLITE_STATIC);
+    if (author && author[0]) sqlite3_bind_text(stmt, bind_idx++, author, -1, SQLITE_STATIC);
+    if (favorited && favorited[0]) sqlite3_bind_text(stmt, bind_idx++, favorited, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, bind_idx++, limit);
+    sqlite3_bind_int(stmt, bind_idx++, offset);
+    
+    Article *articles = calloc(limit > 0 ? limit : 20, sizeof(Article));
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        populate_article(stmt, &articles[count]);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    
+    *out_articles = articles;
+    *out_count = count;
+    return 1;
+}
+
+int db_get_feed(int user_id, int limit, int offset, Article **out_articles, int *out_count, int *out_total) {
+    const char *count_sql = "SELECT COUNT(*) FROM articles WHERE author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)";
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db_conn, count_sql, -1, &stmt, NULL);
+    sqlite3_bind_int(stmt, 1, user_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) *out_total = sqlite3_column_int(stmt, 0);
+    else *out_total = 0;
+    sqlite3_finalize(stmt);
+    
+    const char *sql = "SELECT id, slug, title, description, body, created_at, updated_at, author_id FROM articles WHERE author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?) ORDER BY created_at DESC LIMIT ? OFFSET ?";
+    sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    sqlite3_bind_int(stmt, 1, user_id);
+    sqlite3_bind_int(stmt, 2, limit);
+    sqlite3_bind_int(stmt, 3, offset);
+    
+    Article *articles = calloc(limit > 0 ? limit : 20, sizeof(Article));
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        populate_article(stmt, &articles[count]);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    
+    *out_articles = articles;
+    *out_count = count;
+    return 1;
+}
+
+int db_get_tags(char ***out_tags, int *out_count) {
+    const char *sql = "SELECT name FROM tags";
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    
+    char **tags = calloc(100, sizeof(char *));
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < 100) {
+        tags[count] = strdup((const char *)sqlite3_column_text(stmt, 0));
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    
+    *out_tags = tags;
+    *out_count = count;
+    return 1;
+}
+
+int db_get_article_tags(int article_id, char ***out_tags, int *out_count) {
+    const char *sql = "SELECT t.name FROM tags t JOIN article_tags at ON t.id = at.tag_id WHERE at.article_id = ?";
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    sqlite3_bind_int(stmt, 1, article_id);
+    
+    char **tags = calloc(20, sizeof(char *));
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < 20) {
+        tags[count] = strdup((const char *)sqlite3_column_text(stmt, 0));
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    
+    *out_tags = tags;
+    *out_count = count;
+    return 1;
+}
+
+int db_add_tag_to_article(int article_id, const char *tag) {
+    const char *sql1 = "INSERT OR IGNORE INTO tags (name) VALUES (?)";
+    sqlite3_stmt *stmt1;
+    if (sqlite3_prepare_v2(db_conn, sql1, -1, &stmt1, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt1, 1, tag, -1, SQLITE_STATIC);
+        sqlite3_step(stmt1);
+        sqlite3_finalize(stmt1);
+    }
+    
+    const char *sql2 = "INSERT OR IGNORE INTO article_tags (article_id, tag_id) VALUES (?, (SELECT id FROM tags WHERE name = ?))";
+    sqlite3_stmt *stmt2;
+    if (sqlite3_prepare_v2(db_conn, sql2, -1, &stmt2, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt2, 1, article_id);
+        sqlite3_bind_text(stmt2, 2, tag, -1, SQLITE_STATIC);
+        sqlite3_step(stmt2);
+        sqlite3_finalize(stmt2);
+    }
+    return 0;
 }
 
 int db_delete_article(const char *slug) {

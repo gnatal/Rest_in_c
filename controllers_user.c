@@ -175,3 +175,43 @@ int get_current_user_id(const Request *req) {
     }
     return user_id;
 }
+
+void handler_update_user(const Request *req, Response *res) {
+    int user_id = get_current_user_id(req);
+    if (!user_id) {
+        send_error(res, 401, "unauthorized");
+        return;
+    }
+
+    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
+    yyjson_doc *doc = yyjson_read_opts((char *)req->body, strlen(req->body), 0, &alc, NULL);
+    if (!doc) {
+        send_error(res, 422, "invalid json");
+        return;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *user_obj = yyjson_obj_get(root, "user");
+    if (!user_obj) {
+        send_error(res, 422, "missing user object");
+        return;
+    }
+
+    const char *email = yyjson_get_str(yyjson_obj_get(user_obj, "email"));
+    const char *username = yyjson_get_str(yyjson_obj_get(user_obj, "username"));
+    const char *password = yyjson_get_str(yyjson_obj_get(user_obj, "password"));
+    const char *image = yyjson_get_str(yyjson_obj_get(user_obj, "image"));
+    const char *bio = yyjson_get_str(yyjson_obj_get(user_obj, "bio"));
+
+    char hashed_pw[128] = {0};
+    if (password) {
+        hash_password(password, hashed_pw);
+    }
+
+    User u;
+    if (db_update_user(user_id, email, username, password ? hashed_pw : NULL, image, bio, &u) < 0) {
+        send_error(res, 422, "email or username taken");
+        return;
+    }
+
+    send_user_response(res, 200, &u);
+}

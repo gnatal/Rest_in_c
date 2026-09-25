@@ -36,8 +36,11 @@ int main(void) {
     // Protected User endpoint
     Middleware mw_auth_arr[] = {mw_require_auth};
     router_get_mw(&api_router, "/user", handler_get_current_user, mw_auth_arr, 1);
+    router_put_mw(&api_router, "/user", handler_update_user, mw_auth_arr, 1);
 
     // Article endpoints
+    router_get(&api_router, "/articles", handler_get_articles);
+    router_get(&api_router, "/articles/feed", handler_get_feed);
     router_get(&api_router, "/articles/:slug", handler_get_article);
     router_post_mw(&api_router, "/articles", handler_create_article, mw_auth_arr, 1);
     router_put_mw(&api_router, "/articles/:slug", handler_update_article, mw_auth_arr, 1);
@@ -56,6 +59,9 @@ int main(void) {
     router_get(&api_router, "/articles/:slug/comments", handler_get_comments);
     router_post_mw(&api_router, "/articles/:slug/comments", handler_add_comment, mw_auth_arr, 1);
     router_delete_mw(&api_router, "/articles/:slug/comments/:id", handler_delete_comment, mw_auth_arr, 1);
+
+    // Tags
+    router_get(&api_router, "/tags", handler_get_tags);
 
     // Mount the /api router
     app_mount(&app, "/api", &api_router);
