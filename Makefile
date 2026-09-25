@@ -37,7 +37,7 @@ endif
 CFLAGS += $(SQLITE_CFLAGS) $(OPENSSL_CFLAGS)
 LDFLAGS += $(SQLITE_LDFLAGS) $(OPENSSL_LDFLAGS)
 
-SRCS = main.c db.c crypto.c controllers_user.c
+SRCS = main.c db.c crypto.c controllers_user.c controllers_article.c controllers_profile.c
 OBJS = $(SRCS:.c=.o)
 TARGET = realworld_api
 

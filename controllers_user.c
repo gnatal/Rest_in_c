@@ -166,3 +166,12 @@ void handler_get_current_user(const Request *req, Response *res) {
     
     send_user_response(res, 200, &u);
 }
+
+int get_current_user_id(const Request *req) {
+    const char *auth = req_get_header(req, "Authorization");
+    int user_id = 0;
+    if (auth && strncmp(auth, "Token ", 6) == 0) {
+        jwt_verify(auth + 6, &user_id);
+    }
+    return user_id;
+}
