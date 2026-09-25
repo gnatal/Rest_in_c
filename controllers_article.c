@@ -7,8 +7,7 @@
 #include "vendor/yyjson/yyjson.h"
 
 static void send_error(Response *res, int status, const char *msg) {
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, obj);
     
@@ -43,8 +42,7 @@ static void send_article_response(Response *res, int status, const Article *arti
     int is_favorited = current_user_id ? db_is_favorited(current_user_id, article->id) : 0;
     int favorites_count = db_favorites_count(article->id);
 
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     
@@ -243,8 +241,7 @@ void handler_get_comments(const Request *req, Response *res) {
     }
     
     int current_user_id = get_current_user_id(req);
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     
@@ -282,56 +279,14 @@ void handler_get_articles(const Request *req, Response *res) {
     int limit = limit_str ? atoi(limit_str) : 20;
     int offset = offset_str ? atoi(offset_str) : 0;
     
-    Article *articles = NULL;
-    int count = 0, total = 0;
-    db_get_articles(tag, author, favorited, limit, offset, &articles, &count, &total);
-    
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-    
-    yyjson_mut_val *arr = yyjson_mut_arr(doc);
-    yyjson_mut_obj_add_val(doc, root, "articles", arr);
-    yyjson_mut_obj_add_int(doc, root, "articlesCount", total);
-    
-    for (int i = 0; i < count; i++) {
-        yyjson_mut_val *art_obj = yyjson_mut_obj(doc);
-        yyjson_mut_arr_append(arr, art_obj);
-        
-        yyjson_mut_obj_add_str(doc, art_obj, "slug", articles[i].slug);
-        yyjson_mut_obj_add_str(doc, art_obj, "title", articles[i].title);
-        yyjson_mut_obj_add_str(doc, art_obj, "description", articles[i].description);
-        yyjson_mut_obj_add_str(doc, art_obj, "body", articles[i].body);
-        yyjson_mut_obj_add_str(doc, art_obj, "createdAt", articles[i].created_at);
-        yyjson_mut_obj_add_str(doc, art_obj, "updatedAt", articles[i].updated_at);
-        
-        yyjson_mut_val *tag_arr = yyjson_mut_arr(doc);
-        yyjson_mut_obj_add_val(doc, art_obj, "tagList", tag_arr);
-        
-        char **tags = NULL;
-        int tags_count = 0;
-        db_get_article_tags(articles[i].id, &tags, &tags_count);
-        for (int j = 0; j < tags_count; j++) {
-            yyjson_mut_arr_append(tag_arr, yyjson_mut_str(doc, tags[j]));
-            free(tags[j]);
-        }
-        if (tags) free(tags);
-        
-        int is_favorited = user_id ? db_is_favorited(user_id, articles[i].id) : 0;
-        yyjson_mut_obj_add_bool(doc, art_obj, "favorited", is_favorited);
-        yyjson_mut_obj_add_int(doc, art_obj, "favoritesCount", db_favorites_count(articles[i].id));
-        
-        build_author_json(doc, art_obj, articles[i].author_id, user_id);
+    char *json_result = NULL;
+    if (db_get_articles_fast_json(user_id, limit, offset, &json_result)) {
+        res_status(res, 200);
+        res_json(res, json_result);
+        free(json_result);
+    } else {
+        send_error(res, 500, "database error");
     }
-    
-    if (articles) free(articles);
-    
-    res_status(res, 200);
-    size_t len;
-    char *json = yyjson_mut_write(doc, 0, &len);
-    if (json) { res_json(res, json); free(json); }
-    yyjson_mut_doc_free(doc);
 }
 
 void handler_get_feed(const Request *req, Response *res) {
@@ -348,8 +303,7 @@ void handler_get_feed(const Request *req, Response *res) {
     int count = 0, total = 0;
     db_get_feed(user_id, limit, offset, &articles, &count, &total);
     
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     
@@ -375,7 +329,7 @@ void handler_get_feed(const Request *req, Response *res) {
         int tags_count = 0;
         db_get_article_tags(articles[i].id, &tags, &tags_count);
         for (int j = 0; j < tags_count; j++) {
-            yyjson_mut_arr_append(tag_arr, yyjson_mut_str(doc, tags[j]));
+            yyjson_mut_arr_append(tag_arr, yyjson_mut_strncpy(doc, tags[j], strlen(tags[j])));
             free(tags[j]);
         }
         if (tags) free(tags);
@@ -402,8 +356,7 @@ void handler_get_tags(const Request *req, Response *res) {
     int tags_count = 0;
     db_get_tags(&tags, &tags_count);
     
-    yyjson_alc alc = arena_yyjson_alc(res->conn->arena);
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(&alc);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     
@@ -412,15 +365,18 @@ void handler_get_tags(const Request *req, Response *res) {
     
     for (int i = 0; i < tags_count; i++) {
         yyjson_mut_arr_append(arr, yyjson_mut_str(doc, tags[i]));
-        free(tags[i]);
     }
-    if (tags) free(tags);
     
     res_status(res, 200);
     size_t len;
     char *json = yyjson_mut_write(doc, 0, &len);
     if (json) { res_json(res, json); free(json); }
     yyjson_mut_doc_free(doc);
+    
+    for (int i = 0; i < tags_count; i++) {
+        free(tags[i]);
+    }
+    if (tags) free(tags);
 }
 
 void handler_delete_comment(const Request *req, Response *res) {

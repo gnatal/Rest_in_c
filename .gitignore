@@ -1,0 +1,25 @@
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts and large files
+*.o
+realworld_api
+postman_results.txt
+
+# Rust
+**/target/
+**/*.rs.bk
+
+# Go
+**/go-fiber/go-fiber
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

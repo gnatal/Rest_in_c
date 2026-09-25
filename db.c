@@ -309,6 +309,61 @@ int db_get_articles(const char *tag, const char *author, const char *favorited, 
     return 1;
 }
 
+int db_get_articles_fast_json(int user_id, int limit, int offset, char **out_json) {
+    const char *sql = 
+        "SELECT json_object("
+        "  'articles', COALESCE(("
+        "    SELECT json_group_array("
+        "      json_object("
+        "        'slug', a.slug,"
+        "        'title', a.title,"
+        "        'description', a.description,"
+        "        'body', a.body,"
+        "        'createdAt', a.created_at,"
+        "        'updatedAt', a.updated_at,"
+        "        'favorited', EXISTS(SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = ?1),"
+        "        'favoritesCount', (SELECT COUNT(*) FROM favorites f WHERE f.article_id = a.id),"
+        "        'author', json_object("
+        "          'username', u.username,"
+        "          'bio', u.bio,"
+        "          'image', u.image,"
+        "          'following', EXISTS(SELECT 1 FROM follows fw WHERE fw.follower_id = ?1 AND fw.followed_id = u.id)"
+        "        ),"
+        "        'tagList', COALESCE(("
+        "          SELECT json_group_array(t.name)"
+        "          FROM article_tags at"
+        "          JOIN tags t ON t.id = at.tag_id"
+        "          WHERE at.article_id = a.id"
+        "        ), json_array())"
+        "      )"
+        "    )"
+        "    FROM ("
+        "      SELECT * FROM articles"
+        "      ORDER BY created_at DESC"
+        "      LIMIT ?2 OFFSET ?3"
+        "    ) a"
+        "    JOIN users u ON u.id = a.author_id"
+        "  ), json_array()),"
+        "  'articlesCount', (SELECT COUNT(*) FROM articles)"
+        ");";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    
+    sqlite3_bind_int(stmt, 1, user_id);
+    sqlite3_bind_int(stmt, 2, limit);
+    sqlite3_bind_int(stmt, 3, offset);
+    
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *result = (const char *)sqlite3_column_text(stmt, 0);
+        *out_json = strdup(result ? result : "{}");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
 int db_get_feed(int user_id, int limit, int offset, Article **out_articles, int *out_count, int *out_total) {
     const char *count_sql = "SELECT COUNT(*) FROM articles WHERE author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)";
     sqlite3_stmt *stmt;
@@ -338,20 +393,24 @@ int db_get_feed(int user_id, int limit, int offset, Article **out_articles, int 
 }
 
 int db_get_tags(char ***out_tags, int *out_count) {
+    printf("DEBUG: Entering db_get_tags\n"); fflush(stdout);
     const char *sql = "SELECT name FROM tags";
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL);
+    printf("DEBUG: sqlite3_prepare_v2 returned %d\n", rc); fflush(stdout);
     
     char **tags = calloc(100, sizeof(char *));
     int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && count < 100) {
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && count < 100) {
         tags[count] = strdup((const char *)sqlite3_column_text(stmt, 0));
         count++;
     }
+    printf("DEBUG: sqlite3_step finished with %d, count=%d\n", rc, count); fflush(stdout);
     sqlite3_finalize(stmt);
     
     *out_tags = tags;
     *out_count = count;
+    printf("DEBUG: Exiting db_get_tags\n"); fflush(stdout);
     return 1;
 }
 

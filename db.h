@@ -21,6 +21,7 @@ int db_get_article_by_slug(const char *slug, Article *out_article);
 int db_update_article(const char *slug, const char *title, const char *new_slug, const char *description, const char *body, Article *out_article);
 int db_delete_article(const char *slug);
 
+int db_get_articles_fast_json(int user_id, int limit, int offset, char **out_json);
 int db_get_articles(const char *tag, const char *author, const char *favorited, int limit, int offset, Article **out_articles, int *out_count, int *out_total);
 int db_get_feed(int user_id, int limit, int offset, Article **out_articles, int *out_count, int *out_total);
 int db_get_tags(char ***out_tags, int *out_count);

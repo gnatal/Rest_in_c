@@ -68,8 +68,8 @@ int main(void) {
 
     app.config.port = 8080;
     
-    printf("Starting RealWorld API on port %d...\n", app.config.port);
-    app_listen(&app, app.config.port);
+    printf("Starting RealWorld API on port %d with 4 workers...\n", app.config.port);
+    app_listen_cluster(&app, app.config.port, 4);
     
     db_close();
     app_destroy(&app);

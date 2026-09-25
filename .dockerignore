@@ -1,0 +1,6 @@
+.git
+.github
+vendor/cexpress/.git
+vendor/cexpress/build
+*.o
+realworld_api
