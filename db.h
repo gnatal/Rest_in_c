@@ -1,10 +1,10 @@
 #ifndef DB_H
 #define DB_H
 
-#include <sqlite3.h>
+#include <libpq-fe.h>
 #include "models.h"
 
-extern sqlite3 *db_conn;
+extern PGconn *db_conn;
 
 int db_open(const char *path);
 void db_close(void);
@@ -42,6 +42,6 @@ int db_unfavorite_article(int user_id, int article_id);
 int db_is_favorited(int user_id, int article_id);
 int db_favorites_count(int article_id);
 
-extern sqlite3 *db_conn;
+extern PGconn *db_conn;
 
 #endif // DB_H

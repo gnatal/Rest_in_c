@@ -10,17 +10,9 @@ else
     LDFLAGS = -Lvendor/cexpress/build/lib -lcexpress
 endif
 
-SQLITE_PREFIX ?= $(shell brew --prefix sqlite3 2>/dev/null || brew --prefix sqlite 2>/dev/null || echo /opt/homebrew/opt/sqlite)
-ifeq ($(shell test -d $(SQLITE_PREFIX)/include && echo yes),yes)
-    SQLITE_CFLAGS = -I$(SQLITE_PREFIX)/include
-    SQLITE_LDFLAGS = -L$(SQLITE_PREFIX)/lib -lsqlite3
-else ifeq ($(shell pkg-config --exists sqlite3 2>/dev/null && echo yes),yes)
-    SQLITE_CFLAGS = $(shell pkg-config --cflags sqlite3)
-    SQLITE_LDFLAGS = $(shell pkg-config --libs sqlite3)
-else
-    SQLITE_CFLAGS =
-    SQLITE_LDFLAGS = -lsqlite3
-endif
+LIBPQ_PREFIX ?= /opt/homebrew/opt/libpq
+LIBPQ_CFLAGS = -I$(LIBPQ_PREFIX)/include
+LIBPQ_LDFLAGS = -L$(LIBPQ_PREFIX)/lib -lpq
 
 OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl@1.1 2>/dev/null || echo /opt/homebrew/opt/openssl)
 ifeq ($(shell test -d $(OPENSSL_PREFIX)/include && echo yes),yes)
@@ -34,10 +26,10 @@ else
     OPENSSL_LDFLAGS = -lcrypto
 endif
 
-CFLAGS += $(SQLITE_CFLAGS) $(OPENSSL_CFLAGS)
-LDFLAGS += $(SQLITE_LDFLAGS) $(OPENSSL_LDFLAGS)
+CFLAGS += $(LIBPQ_CFLAGS) $(OPENSSL_CFLAGS)
+LDFLAGS += $(LIBPQ_LDFLAGS) $(OPENSSL_LDFLAGS)
 
-SRCS = main.c db.c crypto.c controllers_user.c controllers_article.c controllers_profile.c
+SRCS = main.c db_pg.c crypto.c controllers_user.c controllers_article.c controllers_profile.c
 OBJS = $(SRCS:.c=.o)
 TARGET = realworld_api
 
