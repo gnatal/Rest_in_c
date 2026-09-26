@@ -23,3 +23,13 @@ postman_results.txt
 .Trashes
 ehthumbs.db
 Thumbs.db
+schema_pg.sql
+.gitignore
+generate_pg.py
+.gitignore
+indexes_pg.sql
+counts_pg.sql
+.gitignore
+bench_pg.sh
+.gitignore
+populate_pg.sql
