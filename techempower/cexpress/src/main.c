@@ -91,51 +91,34 @@ static void send_worlds(Response *res, const World *worlds, int n, int as_array)
     res_json(res, json);
 }
 
+/* The database answers on the event loop (db.c): each handler submits its queries and returns; the
+ * matching done_* callback builds the response once the results are in. */
+
+static void done_worlds(Response *res, const DbJob *job) {
+    send_worlds(res, job->worlds, job->n, job->as_array);
+}
+
 static void handler_db(const Request *req, Response *res) {
     (void)req;
-    res_set_header(res, "Server", SERVER_NAME);
+    res_set_header(res, "Server", SERVER_NAME); /* kept on the deferred response */
     const int id = db_random_id();
-    World w;
-    if (db_fetch_worlds(&id, 1, &w) != 0) {
-        send_error(res);
-        return;
-    }
-    send_worlds(res, &w, 1, 0);
+    db_submit_worlds(res, &id, 1, 0, done_worlds);
 }
 
 static void handler_queries(const Request *req, Response *res) {
     res_set_header(res, "Server", SERVER_NAME);
     const int n = query_count(req);
     int ids[MAX_QUERIES];
-    World worlds[MAX_QUERIES];
     random_ids(ids, n);
-    if (db_fetch_worlds(ids, n, worlds) != 0) {
-        send_error(res);
-        return;
-    }
-    send_worlds(res, worlds, n, 1);
+    db_submit_worlds(res, ids, n, 1, done_worlds);
 }
 
 static void handler_updates(const Request *req, Response *res) {
     res_set_header(res, "Server", SERVER_NAME);
     const int n = query_count(req);
     int ids[MAX_QUERIES];
-    World worlds[MAX_QUERIES];
     random_ids(ids, n);
-    if (db_fetch_worlds(ids, n, worlds) != 0) {
-        send_error(res);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        int r;
-        do r = db_random_id(); while (r == worlds[i].random_number);
-        worlds[i].random_number = r;
-    }
-    if (db_update_worlds(worlds, n) != 0) {
-        send_error(res);
-        return;
-    }
-    send_worlds(res, worlds, n, 1);
+    db_submit_updates(res, ids, n, done_worlds);
 }
 
 /* ---- /fortunes ---- */
@@ -171,16 +154,10 @@ static void html_escaped(HtmlOut *o, const char *s, size_t n) {
     }
 }
 
-static void handler_fortunes(const Request *req, Response *res) {
-    (void)req;
-    res_set_header(res, "Server", SERVER_NAME);
+static void done_fortunes(Response *res, const DbJob *job) {
     Fortune fortunes[MAX_FORTUNES + 1];
-    void *pg_result;
-    int n = db_fetch_fortunes(fortunes, MAX_FORTUNES, &pg_result);
-    if (n < 0) {
-        send_error(res);
-        return;
-    }
+    int n = job->fortune_count;
+    memcpy(fortunes, job->fortunes, (size_t)n * sizeof(Fortune)); /* messages still point into the job's result */
     fortunes[n++] = (Fortune){0, EXTRA_FORTUNE, sizeof(EXTRA_FORTUNE) - 1};
     qsort(fortunes, (size_t)n, sizeof(Fortune), cmp_fortune);
 
@@ -192,8 +169,8 @@ static void handler_fortunes(const Request *req, Response *res) {
 
     HtmlOut o = {arena_alloc(res->conn->arena, cap), 0};
     if (!o.buf) {
-        db_release(pg_result);
-        { send_error(res); return; }
+        send_error(res);
+        return;
     }
     html_raw(&o, head, sizeof(head) - 1);
     for (int i = 0; i < n; i++) {
@@ -205,8 +182,13 @@ static void handler_fortunes(const Request *req, Response *res) {
         html_raw(&o, "</td></tr>", 10);
     }
     html_raw(&o, tail, sizeof(tail) - 1);
-    db_release(pg_result);
     res_send_bytes(res, HTML_TYPE, (const unsigned char *)o.buf, o.len);
+}
+
+static void handler_fortunes(const Request *req, Response *res) {
+    (void)req;
+    res_set_header(res, "Server", SERVER_NAME);
+    db_submit_fortunes(res, done_fortunes);
 }
 
 int main(void) {
@@ -220,7 +202,7 @@ int main(void) {
      * json/plaintext container runs without a database. */
     const char *db_env = getenv("CEXPRESS_DB");
     if (db_env && strcmp(db_env, "1") == 0) {
-        app_on_worker_start(&app, db_worker_init);
+        db_setup(&app); /* per-worker connection, opened after fork */
         app_get(&app, "/db", handler_db);
         app_get(&app, "/queries", handler_queries);
         app_get(&app, "/updates", handler_updates);

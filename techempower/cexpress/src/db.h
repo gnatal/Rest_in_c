@@ -2,28 +2,31 @@
 #define TFB_DB_H
 
 #include "tfb_types.h"
-#include <stddef.h>
 
-/* One libpq connection per worker process, opened by db_worker_init (app_on_worker_start hook)
- * and kept in pipeline mode for the life of the worker: every request's queries are sent in one
- * batch and read back after a single round trip. Calls block the worker's event loop while they
- * wait for Postgres, so the DB variant runs more workers than cores (see cexpress-postgres.dockerfile). */
+/*
+ * One non-blocking libpq connection per worker process, in pipeline mode, shared by every request on that
+ * worker. A handler submits its queries and returns (res_defer); the event loop watches the connection's
+ * socket (app_watch_fd) and answers each request when its results arrive (res_resume). Many requests'
+ * queries are in flight on one connection at once, which is what keeps one worker per core busy.
+ */
 
-void db_worker_init(void);
+/* Remembers the App (the worker-start hook takes no argument) and registers the per-worker connect hook. */
+void db_setup(App *app);
 
 /* Uniform random World id in 1..WORLD_ROWS, per-worker generator seeded after fork. */
 int db_random_id(void);
 
-/* Fill `out[0..n)` with the rows for `ids[0..n)`: n separate SELECTs in one pipeline. 0 / -1. */
-int db_fetch_worlds(const int *ids, int n, World *out);
-
-/* Write `worlds[i].random_number` for every row in one UPDATE ... FROM (VALUES ...) statement,
- * prepared lazily per row count. `worlds` must hold distinct ids. 0 / -1. */
-int db_update_worlds(const World *worlds, int n);
-
-/* All Fortune rows into `out` (at most `cap`). Strings point into *result_out, which the caller
- * releases with db_release(). Returns the row count or -1. */
-int db_fetch_fortunes(Fortune *out, int cap, void **result_out);
-void db_release(void *result);
+/*
+ * Submit a request's work. Each defers `res` and returns; `done` builds the response later. On any
+ * failure (no connection, a send error, a query error) the client gets 500 and `done` is not called;
+ * over the engine's memory budget it gets 503.
+ *   db_submit_worlds: n SELECTs for ids[0..n) (as_array: /queries; else /db, one object).
+ *   db_submit_updates: n SELECTs, then new random numbers, then one UPDATE of all n rows; `done` sees the
+ *     updated values. ids must be distinct.
+ *   db_submit_fortunes: every fortune in job->fortunes[0..fortune_count), room for one more at the end.
+ */
+void db_submit_worlds(Response *res, const int *ids, int n, int as_array, DbDone done);
+void db_submit_updates(Response *res, const int *ids, int n, DbDone done);
+void db_submit_fortunes(Response *res, DbDone done);
 
 #endif

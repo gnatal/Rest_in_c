@@ -15,15 +15,17 @@ allocator, [yyjson](https://github.com/ibireme/yyjson) for JSON and picohttppars
 
 ## Important Libraries
 
-* libpq, one connection per worker process, in pipeline mode: a request's queries are sent as
-  separate statements in one batch and read back after one round trip ([src/db.c](src/db.c)).
+* libpq, one non-blocking connection per worker process, in pipeline mode, shared by every request on
+  that worker ([src/db.c](src/db.c)). A handler queues its queries and a sync, then defers its response
+  (`res_defer`); the event loop watches the connection's socket (`app_watch_fd`) and each request is answered
+  (`res_resume`) when its sync comes back. Many requests' queries are in flight on one connection at once.
 * Updates are written with one `UPDATE ... FROM (VALUES ...)` statement per request.
 
 ## Variants
 
 * `cexpress`: json and plaintext, one worker per core.
-* `cexpress-postgres`: db, query, fortunes and updates. Handlers block on Postgres, so the container
-  runs 4 workers per core.
+* `cexpress-postgres`: db, query, fortunes and updates. One worker per core (`CEXPRESS_WORKERS` overrides
+  it): handlers do not block on Postgres.
 
 ## Test URLs
 
