@@ -8,6 +8,8 @@
  * worker. A handler submits its queries and returns (res_defer); the event loop watches the connection's
  * socket (app_watch_fd) and answers each request when its results arrive (res_resume). Many requests'
  * queries are in flight on one connection at once, which is what keeps one worker per core busy.
+ * With libpq 17+ (PQsendPipelineSync) a request's queries are only buffered; an app_on_turn_end hook sends
+ * everything one event-loop turn queued in one PQflush. With an older libpq every request flushes.
  */
 
 /* Remembers the App (the worker-start hook takes no argument) and registers the per-worker connect hook. */

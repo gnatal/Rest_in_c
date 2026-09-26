@@ -15,6 +15,8 @@ static PGconn *g_conn;                                /* per worker; closed by p
 static int g_fd = -1;                                 /* PQsocket(g_conn), watched with app_watch_fd */
 static unsigned g_watching;                           /* WATCH_* currently asked for on g_fd */
 static int g_broken;                                  /* the connection failed: every request gets 500 */
+static int g_unsent;                                  /* queries queued in libpq since the last flush */
+static int g_flush_each;                              /* CEXPRESS_PG_FLUSH_EACH=1: flush per request (A/B baseline) */
 static unsigned int rng_state;                        /* per worker, seeded in db_worker_init */
 static unsigned char update_prepared[MAX_QUERIES + 1]; /* update_prepared[n]: "upd<n>" prepared or in flight */
 
@@ -114,6 +116,26 @@ static void flush_output(void) {
     watch(rc == 1 ? (WATCH_READ | WATCH_WRITE) : WATCH_READ);
 }
 
+/* Ends a request's queries (or a phase of them). With libpq 17+ the sync is only buffered and the turn-end
+ * hook sends everything this event-loop turn queued in one flush; libpq 16's PQpipelineSync flushes itself. */
+static int pipeline_sync(void) {
+    g_unsent = 1;
+#ifdef LIBPQ_HAS_SEND_PIPELINE_SYNC
+    if (!g_flush_each) return PQsendPipelineSync(g_conn);
+#endif
+    return PQpipelineSync(g_conn);
+}
+
+/* app_on_turn_end hook: every handler and result callback of this turn has queued its queries; send them. */
+static void on_turn_end(App *app, void *udata) {
+    (void)app;
+    (void)udata;
+    if (g_unsent && !g_broken) {
+        g_unsent = 0;
+        flush_output();
+    }
+}
+
 static int cmp_world_id(const void *a, const void *b) {
     const int x = ((const World *)a)->id, y = ((const World *)b)->id;
     return (x > y) - (x < y);
@@ -127,7 +149,7 @@ static int send_selects(const DbJob *job, const int *ids) {
         const char *params[1] = {id_text};
         if (!PQsendQueryPrepared(g_conn, "world", 1, params, NULL, NULL, 0)) return -1;
     }
-    return PQpipelineSync(g_conn) ? 0 : -1;
+    return pipeline_sync() ? 0 : -1;
 }
 
 /* Queues one UPDATE ... FROM (VALUES ...) of job->worlds (prepared lazily per row count) and its sync. */
@@ -161,7 +183,7 @@ static int send_update(DbJob *job) {
         params[2 * i + 1] = text[2 * i + 1];
     }
     if (!PQsendQueryPrepared(g_conn, name, 2 * job->n, params, NULL, NULL, 0)) return -1;
-    return PQpipelineSync(g_conn) ? 0 : -1;
+    return pipeline_sync() ? 0 : -1;
 }
 
 /* The head job's sync arrived: its current phase is complete. */
@@ -267,8 +289,8 @@ static void on_pg_ready(App *app, int fd, unsigned events, void *udata) {
         }
         drain_results();
     }
-    if (!g_broken) {
-        flush_output(); /* an /updates phase 2 may have queued more; also the WATCH_WRITE case */
+    if (!g_broken && ((events & WATCH_WRITE) || g_flush_each)) {
+        flush_output(); /* the rest of a partial send; an /updates phase 2 waits for the turn-end flush */
     }
 }
 
@@ -293,6 +315,8 @@ static void prepare_or_die(const char *name, const char *sql, int nparams, const
 /* app_on_worker_start hook: runs in each worker after fork, before its event loop starts (app_watch_fd
  * stores the watch until then). */
 static void db_worker_init(void) {
+    const char *flush_each = getenv("CEXPRESS_PG_FLUSH_EACH");
+    g_flush_each = flush_each != NULL && strcmp(flush_each, "1") == 0;
     rng_state = (unsigned int)getpid() * 2654435761u ^ (unsigned int)time(NULL);
     if (rng_state == 0) rng_state = 1;
 
@@ -319,6 +343,7 @@ static void db_worker_init(void) {
 void db_setup(App *app) {
     g_app = app;
     app_on_worker_start(app, db_worker_init);
+    app_on_turn_end(app, on_turn_end, NULL);
 }
 
 int db_random_id(void) {
@@ -363,7 +388,7 @@ static DbJob *job_begin(Response *res, const DbJobKind kind, const int n, const 
     return job;
 }
 
-/* The job's queries are queued in libpq (sent == 0): it joins the FIFO and the output is flushed. A send
+/* The job's queries are queued in libpq (sent == 0): it joins the FIFO; the turn-end hook flushes. A send
  * that failed means the connection is broken: every queued request, this one included, gets 500. */
 static void job_commit(DbJob *job, const int sent) {
     enqueue(job);
@@ -371,7 +396,7 @@ static void job_commit(DbJob *job, const int sent) {
         connection_lost();
         return;
     }
-    flush_output();
+    if (g_flush_each) flush_output();
 }
 
 void db_submit_worlds(Response *res, const int *ids, const int n, const int as_array, DbDone done) {
@@ -391,7 +416,7 @@ void db_submit_updates(Response *res, const int *ids, const int n, DbDone done) 
 void db_submit_fortunes(Response *res, DbDone done) {
     DbJob *job = job_begin(res, DB_JOB_FORTUNES, 0, 0, done);
     if (job != NULL) {
-        const int sent = PQsendQueryPrepared(g_conn, "fortune", 0, NULL, NULL, NULL, 0) && PQpipelineSync(g_conn);
+        const int sent = PQsendQueryPrepared(g_conn, "fortune", 0, NULL, NULL, NULL, 0) && pipeline_sync();
         job_commit(job, sent ? 0 : -1);
     }
 }

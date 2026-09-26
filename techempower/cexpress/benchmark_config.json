@@ -41,6 +41,48 @@
         "display_name": "cexpress [pg]",
         "notes": "",
         "versus": "None"
+      },
+      "postgres-flusheach": {
+        "db_url": "/db",
+        "query_url": "/queries?queries=",
+        "fortune_url": "/fortunes",
+        "update_url": "/updates?queries=",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Micro",
+        "database": "Postgres",
+        "framework": "cexpress",
+        "language": "C",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "None",
+        "webserver": "None",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "cexpress [pg, flush each]",
+        "notes": "",
+        "versus": "None"
+      },
+      "postgres-w2x": {
+        "db_url": "/db",
+        "query_url": "/queries?queries=",
+        "fortune_url": "/fortunes",
+        "update_url": "/updates?queries=",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Micro",
+        "database": "Postgres",
+        "framework": "cexpress",
+        "language": "C",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "None",
+        "webserver": "None",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "cexpress [pg, 2x workers]",
+        "notes": "",
+        "versus": "None"
       }
     }
   ]

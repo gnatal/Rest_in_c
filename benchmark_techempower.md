@@ -11,14 +11,14 @@ their wrk load generator, their request mix and concurrency levels. Every entry 
 | Docker | Colima VM, **10 CPUs, 12 GB**. Server, Postgres and wrk share it (TechEmpower uses 3 separate machines) |
 | Entries | `cexpress` / `cexpress-postgres`, `actix` / `actix-http`, `axum` / `axum-pg`, `h2o`, `fiber` |
 | Load | TFB defaults: 15 s per level; concurrency 16-512 (json, db, fortune), 512 (query, update, 1-20 queries), 256-16384 with pipelining 16 (plaintext) |
-| Runs | 3 full runs (2026-09-25/26), results under `techempower/.tfb/results/`: run 1 `20260926010854`, run 2 `20260926023941` (all six tests), run 3 `20260926132736` (the four DB tests only) |
+| Runs | 4 full runs (2026-09-25/26), results under `techempower/.tfb/results/`: run 1 `20260926010854`, run 2 `20260926023941`, run 3 `20260926132736` (the four DB tests only), run 4 `20260926145131` (all six tests) |
 
 What CExpress ran in each:
 
 | Run | Engine | TFB app (`cexpress-postgres`) |
 |---|---|---|
 | 1, 2 | `c_server` `bf91ef7`: one `write` per pipelined response, handlers can't wait on I/O | one **blocking** libpq connection per worker, 4 workers per core |
-| 3 | `c_server` `288068e`: coalesced pipelined writes, `res_defer` / `res_resume`, `app_watch_fd` | one **non-blocking, pipelined** libpq connection per worker, shared by all its requests; 1 worker per core |
+| 3, 4 | `c_server` `288068e`: coalesced pipelined writes, `res_defer` / `res_resume`, `app_watch_fd` | one **non-blocking, pipelined** libpq connection per worker, shared by all its requests; 1 worker per core |
 
 Numbers are the best req/s across concurrency levels (req/s = `totalRequests / 15 s`). No test failed, and there
 were **zero non-2xx responses** in any run. Every entry has some wrk socket timeouts at the highest concurrency levels
@@ -26,64 +26,87 @@ in similar amounts, which comes from sharing 10 cores between wrk, Postgres and 
 
 ## Results (req/s)
 
-JSON and plaintext were not part of run 3; plaintext was re-run alone after the pipelined-write fix (below).
+JSON and plaintext were not part of run 3; plaintext was also run alone after the pipelined-write fix (below).
 
-### JSON serialization: CExpress 1st
-| Framework | Run 1 | Run 2 |
-|---|---:|---:|
-| **cexpress** | **764,242** | **771,136** |
-| actix | 719,879 | 752,766 |
-| axum | 692,841 | 708,224 |
-| h2o | 684,221 | 706,159 |
-| fiber | 620,965 | 581,602 |
-
-### Plaintext (pipelined): CExpress 5th → 1st after coalesced writes (one run)
-| Framework | Run 1 | Run 2 | Plaintext-only run `20260926105312` |
+### JSON serialization: CExpress 1st in all three runs
+| Framework | Run 1 | Run 2 | Run 4 |
 |---|---:|---:|---:|
-| **cexpress** | **1,587,520** | **1,597,938** | **4,910,252** |
-| actix | 4,273,428 | 4,623,852 | 4,689,204 |
-| axum | 3,421,789 | 3,938,829 | 3.69M |
-| fiber | 3,356,678 | 3,561,613 | 3.65M |
-| h2o | 1,587,542 | 1,656,091 | 1.62M |
+| **cexpress** | **764,242** | **771,136** | **787,754** |
+| actix | 719,879 | 752,766 | 738,709 |
+| axum | 692,841 | 708,224 | 727,775 |
+| h2o | 684,221 | 706,159 | 699,260 |
+| fiber | 620,965 | 581,602 | 590,756 |
 
-The plaintext-only run used the engine with coalesced pipelined writes (`c_server` `3d804c9`). CExpress was 1st at every pipelined level there;
-its 5% lead over Actix is inside Actix's own run-to-run spread (4.27M / 4.62M / 4.69M).
-
-### Single query (db): CExpress 4th, 52-54% → 97% of the leader
-| Framework | Run 1 | Run 2 | Run 3 |
-|---|---:|---:|---:|
-| actix-http | 289,136 | 337,842 | 307,632 |
-| axum-pg | 285,426 | 293,864 | 302,879 |
-| h2o | 298,922 | 308,487 | 301,387 |
-| **cexpress-postgres** | **155,174** | **177,588** | **297,671** |
-| fiber | 132,298 | 126,166 | 131,994 |
-
-### Multiple queries (query): CExpress 4th → 1st
-| Framework | Run 1 | Run 2 | Run 3 | Run 3, 20 queries |
+### Plaintext (pipelined): CExpress 5th → 1st after coalesced writes (two runs)
+| Framework | Run 1 | Run 2 | Plaintext-only run `20260926105312` | Run 4 |
 |---|---:|---:|---:|---:|
-| **cexpress-postgres** | **152,222** | **169,539** | **301,411** | **65,533** |
-| actix-http | 284,788 | 310,681 | 299,320 | 27,713 |
-| h2o | 268,648 | 296,421 | 297,611 | 25,197 |
-| axum-pg | 304,269 | 294,780 | 293,978 | 28,454 |
-| fiber | 109,526 | 119,204 | 124,136 | 9,627 |
+| **cexpress** | **1,587,520** | **1,597,938** | **4,910,252** | **4,813,888** |
+| actix | 4,273,428 | 4,623,852 | 4,689,204 | 4,412,559 |
+| axum | 3,421,789 | 3,938,829 | 3.69M | 3,795,426 |
+| fiber | 3,356,678 | 3,561,613 | 3.65M | 3,511,990 |
+| h2o | 1,587,542 | 1,656,091 | 1.62M | 1,568,702 |
 
-### Fortunes: CExpress 4th → 3rd, 59-60% → 96% of the leader
-| Framework | Run 1 | Run 2 | Run 3 |
-|---|---:|---:|---:|
-| h2o | 275,478 | 301,100 | 295,283 |
-| actix-http | 294,812 | 295,137 | 288,853 |
-| **cexpress-postgres** | **170,498** | **180,969** | **282,844** |
-| axum-pg | 294,532 | 279,486 | 282,753 |
-| fiber | 113,815 | 117,632 | 119,492 |
+The plaintext-only run used the engine with coalesced pipelined writes (`c_server` `3d804c9`); run 4 used `288068e`.
+CExpress was 1st at every pipelined level in both (run 4: 4.78M / 4.81M / 4.09M / 3.34M at 256 / 1,024 / 4,096 /
+16,384 connections, Actix 4.41M / 4.26M / 3.48M / 2.82M). Its lead over Actix is 5% and 9%.
 
-### Updates: CExpress 4th → 1st
-| Framework | Run 1 | Run 2 | Run 3 | Run 3, 20 updates |
+### Single query (db): CExpress 4th, 52-54% → 96-97% of the leader
+| Framework | Run 1 | Run 2 | Run 3 | Run 4 |
 |---|---:|---:|---:|---:|
-| **cexpress-postgres** | **75,005** | **77,888** | **158,507** | **34,266** |
-| actix-http | 142,456 | 168,677 | 151,049 | 18,930 |
-| axum-pg | 135,391 | 142,293 | 143,699 | 18,616 |
-| h2o | 118,694 | 139,556 | 126,403 | 15,267 |
-| fiber | 63,222 | 68,221 | 68,507 | 7,353 |
+| actix-http | 289,136 | 337,842 | 307,632 | 311,464 |
+| axum-pg | 285,426 | 293,864 | 302,879 | 306,329 |
+| h2o | 298,922 | 308,487 | 301,387 | 311,737 |
+| **cexpress-postgres** | **155,174** | **177,588** | **297,671** | **299,887** |
+| fiber | 132,298 | 126,166 | 131,994 | 131,725 |
+
+### Multiple queries (query): tied at 1 query, CExpress 1st by 2.3× at 20
+| Framework | Run 1 | Run 2 | Run 3 | Run 4 | 20 queries, run 3 / 4 |
+|---|---:|---:|---:|---:|---:|
+| **cexpress-postgres** | **152,222** | **169,539** | **301,411** | **302,805** | **65,533 / 66,051** |
+| actix-http | 284,788 | 310,681 | 299,320 | 309,852 | 27,713 / 28,575 |
+| h2o | 268,648 | 296,421 | 297,611 | 304,634 | 25,197 / 23,394 |
+| axum-pg | 304,269 | 294,780 | 293,978 | 298,046 | 28,454 / 29,132 |
+| fiber | 109,526 | 119,204 | 124,136 | 122,554 | 9,627 / 9,587 |
+
+### Fortunes: CExpress 3rd-4th, 59-60% → 93-96% of the leader
+| Framework | Run 1 | Run 2 | Run 3 | Run 4 |
+|---|---:|---:|---:|---:|
+| h2o | 275,478 | 301,100 | 295,283 | 295,790 |
+| actix-http | 294,812 | 295,137 | 288,853 | 278,265 |
+| **cexpress-postgres** | **170,498** | **180,969** | **282,844** | **275,448** |
+| axum-pg | 294,532 | 279,486 | 282,753 | 284,364 |
+| fiber | 113,815 | 117,632 | 119,492 | 108,479 |
+
+### Updates: CExpress 1st or tied at 1 query, 1st by 1.7-1.8× at 20
+| Framework | Run 1 | Run 2 | Run 3 | Run 4 | 20 updates, run 3 / 4 |
+|---|---:|---:|---:|---:|---:|
+| **cexpress-postgres** | **75,005** | **77,888** | **158,507** | **157,191** | **34,266 / 33,306** |
+| actix-http | 142,456 | 168,677 | 151,049 | 157,190 | 18,930 / 19,731 |
+| axum-pg | 135,391 | 142,293 | 143,699 | 145,346 | 18,616 / 19,717 |
+| h2o | 118,694 | 139,556 | 126,403 | 143,981 | 15,267 / 17,402 |
+| fiber | 63,222 | 68,221 | 68,507 | 68,954 | 7,353 / 7,418 |
+
+## Run 4: does run 3's ranking hold?
+
+Same code as run 3, all six tests, all eight entries in one run. Best req/s and the spread of the top four:
+
+| Test | CExpress, run 3 → 4 | Place run 3 → 4 | Top four within (run 3 / 4) | Leader in run 4 |
+|---|---:|---|---|---|
+| db | 297,671 → 299,887 | 4th → 4th | 3.2% / 3.8% | h2o 311,737 (actix-http 311,464) |
+| query, 1 query | 301,411 → 302,805 | 1st → 3rd | 2.5% / 3.8% | actix-http 309,852 |
+| query, 20 queries | 65,533 → 66,051 | 1st → 1st | – | 2.27× axum-pg (29,132) |
+| fortune | 282,844 → 275,448 | 3rd → 4th | 4.2% / 6.9% | h2o 295,790 |
+| update, 1 query | 158,507 → 157,191 | 1st → 1st (by 1 req/s) | – / 8.4% | tied with actix-http 157,190 |
+| update, 20 queries | 34,266 → 33,306 | 1st → 1st | – | 1.69× actix-http (19,731) |
+
+CExpress's own numbers moved by at most 2.8% between runs 3 and 4; the places at one query moved because the
+competitors moved (actix-http +3.5% on query, h2o +14% on update). What held in both runs: **db, fortune and query
+at one query are a four-way tie** within a few percent, and **CExpress leads by 1.35-2.3× from 5 queries on**
+(run 4: query 1.59× / 1.90× / 2.13× / 2.27× and update 1.35× / 1.56× / 1.64× / 1.69× at 5 / 10 / 15 / 20). Fortune
+is CExpress's weakest DB test: 7% behind h2o in run 4, 4% in run 3. At 16 connections Actix-http is again the
+outlier on db (156k; cexpress 76k, axum 77k), but h2o joined it this time (144k), so that level is noisy for
+everyone. wrk timeouts for cexpress-postgres in run 4 were low: 260 on db (h2o 0, the others 1,260-1,487) and 509
+on query, the fewest of the five.
 
 ## Run 3: before and after non-blocking libpq
 
@@ -145,13 +168,14 @@ leaders. The non-blocking app runs one worker per core and has not been swept ye
 
 ## What the numbers say
 
-- **The engine is competitive on the request path.** CExpress wins JSON in both runs that included it.
+- **The engine is competitive on the request path.** CExpress wins JSON in all three runs that included it.
 - **Pipelined plaintext is fixed.** Responses to a pipelined batch are now gathered and written once, as Actix, Axum
-  and Fiber do (they were written one syscall each). Plaintext went from 1.60M to 4.91M, 1st in one run.
+  and Fiber do (they were written one syscall each). Plaintext went from 1.60M to 4.81-4.91M, 1st in both runs since.
 - **Database tests are at parity, and ahead with many queries per request.** With libpq's socket in the event loop, a
   worker serves other requests while its queries are in flight, and many requests share one pipelined connection. db
   and fortune are in a tie with Actix, Axum and h2o; query and update lead at every query count, by 1.4-2.3× from 5
   queries on.
-- **Open questions:** whether run 3's ranking holds in a second full run (it is one run), the worker count for the
-  non-blocking app, and the 16-connection gap to Actix.
+- **Open questions:** the worker count for the non-blocking app, fortune (the one DB test where CExpress trails the
+  leader by more than noise in both runs, 4-7%), and one `send` per event-loop turn to Postgres instead of one per
+  request.
 - Everything ran on one laptop. Rankings within a run matter more than the absolute numbers.

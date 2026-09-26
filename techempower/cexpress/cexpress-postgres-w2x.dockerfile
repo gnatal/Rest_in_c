@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/tfb-cexpress /usr/local/bin/tfb-cexpress
 ENV CEXPRESS_DB=1
+# Worker sweep, temporary: 2 workers per core (the TFB VM has 10 CPUs).
+ENV CEXPRESS_WORKERS=20
 EXPOSE 8080
 # Handlers no longer block on Postgres (each worker keeps many requests' queries in flight on one pipelined
 # connection), so one worker per core. CEXPRESS_WORKERS overrides it for a sweep.

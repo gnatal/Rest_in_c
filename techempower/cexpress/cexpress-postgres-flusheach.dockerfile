@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/tfb-cexpress /usr/local/bin/tfb-cexpress
 ENV CEXPRESS_DB=1
+# A/B baseline, temporary: flush after every request, as with libpq 16.
+ENV CEXPRESS_PG_FLUSH_EACH=1
 EXPOSE 8080
 # Handlers no longer block on Postgres (each worker keeps many requests' queries in flight on one pipelined
 # connection), so one worker per core. CEXPRESS_WORKERS overrides it for a sweep.
