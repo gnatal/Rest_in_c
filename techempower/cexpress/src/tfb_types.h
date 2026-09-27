@@ -36,8 +36,9 @@ typedef void (*DbDone)(Response *res, const struct DbJob *job);
 
 /*
  * One HTTP request's database work. Queued in send order (db.c's FIFO): the connection's pipeline answers
- * in that order, and each job's queries end with a sync, so every PGRES_PIPELINE_SYNC completes the job at
- * the head. Owned by db.c (a free list), never by the request: the client may leave while its queries are
+ * in that order. Every statement is followed by its own sync (TFB general requirement #7), so a phase ends
+ * when its last PGRES_PIPELINE_SYNC arrives (`syncs_left` reaches 0) and completes the job at the head.
+ * Owned by db.c (a free list), never by the request: the client may leave while its queries are
  * still in the pipeline. Released after `done` ran (or the request was found gone).
  */
 typedef struct DbJob {
@@ -49,6 +50,7 @@ typedef struct DbJob {
     int got;                     /* rows received in the current phase */
     int failed;                  /* any query of the current phase failed */
     int prepare_pending;         /* phase 2: the lazily prepared UPDATE's own result comes first */
+    int syncs_left;              /* syncs of the current phase still to arrive (one per statement) */
     int as_array;                /* /queries and /updates answer an array, /db one object */
     World worlds[MAX_QUERIES];
     Fortune fortunes[MAX_FORTUNES + 1];

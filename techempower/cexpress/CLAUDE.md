@@ -10,6 +10,12 @@
   fortune), selected at runtime by `CEXPRESS_DB=1`. Both use one worker process per core (`CEXPRESS_WORKERS`
   overrides it). With one non-blocking connection per worker, more workers only add Postgres backends and context
   switches (MEASURED, run 5: 1 per core beats 2 per core by 5-6% on db/query).
+- **CPU pinning (`src/pin.c`, `cexpress-postgres` only).** An `app_on_worker_start` hook, registered before
+  `db_setup`'s, pins each worker to one CPU: worker `cluster_worker_id()` = i gets the i-th CPU of its startup
+  affinity (wrapping past the CPU count; a respawned worker keeps its slot id, so its CPU). Not pinned when the
+  process is not a cluster worker, or with `CEXPRESS_PIN_WORKERS=0`. The `cexpress-postgres-nopin` entry is the same
+  binary with that set, the A/B baseline for a TFB run. MEASURED locally (fortune, 512 connections, 3 alternating
+  pairs): +4.4%; db unchanged.
 - `cexpress-postgres.dockerfile` installs libpq from the PostgreSQL apt repository (18.x); Ubuntu 24.04's own libpq
   is 16. `db.c` picks the buffered sync with `#ifdef LIBPQ_HAS_SEND_PIPELINE_SYNC` (defined by libpq-fe.h from 17),
   so the same source builds against 16, where each request flushes on its own.
@@ -19,17 +25,21 @@
   only for connect and for preparing `world` and `fortune`. Then non-blocking, pipeline mode, and its socket is
   registered with `app_watch_fd` (applied when the loop opens). Every request on the worker shares it; there is no
   cross-worker state.
-- **Jobs.** A handler takes a `DbJob`, `res_defer`s its response, queues its queries followed by a sync, and returns.
-  Jobs sit in one FIFO in send order. The pipeline answers in that order and each job ends with a sync, so every
-  `PGRES_PIPELINE_SYNC` completes the head job. `finish` calls `res_resume`: NULL means the client left, and the
+- **Jobs.** A handler takes a `DbJob`, `res_defer`s its response, queues its queries (each followed by its own
+  sync) and returns. Jobs sit in one FIFO in send order and the pipeline answers in that order. A job's phase
+  expects one `PGRES_PIPELINE_SYNC` per statement (`syncs_left`); the last one completes the head job. `finish` calls `res_resume`: NULL means the client left, and the
   result is dropped; otherwise `done` builds the response (or 500 if a query failed or rows are missing).
-- **`/updates` has two phases in one job.** Phase 1: the n SELECTs and a sync. When that sync arrives, new random
+- **`/updates` has two phases in one job.** Phase 1: the n SELECTs, each with its own sync. When the last sync arrives, new random
   numbers are drawn and the job is re-queued at the tail with phase 2: one `UPDATE ... FROM (VALUES ...)` and a sync.
-  The UPDATE is prepared lazily per row count (`upd<n>`); `update_prepared[n]` is set as soon as the PREPARE is
-  queued, so later jobs of the same size use it behind it in the pipeline, and it is reset if the PREPARE fails.
+  The UPDATE is prepared lazily per row count (`upd<n>`), the PREPARE with a sync of its own (phase 2 then
+  expects two syncs); `update_prepared[n]` is set as soon as the PREPARE is queued, so later jobs of the same size use it behind it in the pipeline, and it is reset if the PREPARE fails.
   Ids are sorted before the UPDATE so concurrent batches lock rows in the same order (no deadlocks); handlers pass
   distinct ids.
-- **One implicit transaction per request** (each sync ends one), so a failed query fails only its own request.
+- **One sync per statement, never per request** (TFB general requirement #7: "If using PostgreSQL's extended
+  query protocol, each query must be separated by a Sync message"). Each sync ends an implicit transaction, so
+  every statement runs and fails on its own, as in separate round trips; a failed statement makes its request
+  500 but does not skip the request's other statements. Pipelining (many statements per network send, many
+  requests per connection) is what the rule permits. Runs 1-9 predate this and sent one sync per request.
 
 ## Flush policy
 - Every sync is `PQsendPipelineSync` (buffered, no send) and sets `g_unsent`. The `app_on_turn_end` hook sends
@@ -42,7 +52,9 @@
   - Run 6 (one run): flushing a result callback's follow-up queries right after the read, instead of at turn end,
     changed updates by +0.5-2.8%, inside noise, so it was not kept. Run 5's update loss at 1-5 queries did not
     reproduce in run 6.
-  - Numbers and result folders: `../../benchmark_techempower.md`.
+  - Run 10 (`20260927113740`, the first with one sync per statement): query and update 1st at every count by
+    0.4-6.6%, down from 1.4-2.3× with one sync per request.
+  - Numbers and result folders: `c_server/techEmpV1.md` (next to this repository).
 
 ## Failure handling
 - A send or `PQconsumeInput`/`PQflush` failure marks the connection broken (`g_broken`): the socket is unwatched,
@@ -62,6 +74,8 @@
 - The connection is closed by process exit.
 
 ## Verification
+- `make test` (`CC=gcc-16` on macOS) runs `tests/test_pin.c`: the app's pure helpers, no engine or libpq; the
+  affinity case runs on Linux only.
 - `./run.sh` (no arguments) runs TFB verify on both entries; it must be all PASS. Benchmarks:
   `./run.sh --mode benchmark --test ... --type ...`; results in `../.tfb/results/<timestamp>/results.json`
   (req/s = `totalRequests / 15`, best across levels).

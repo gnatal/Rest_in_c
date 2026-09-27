@@ -2,6 +2,7 @@
  * Spec: https://github.com/TechEmpower/FrameworkBenchmarks/wiki/Project-Information-Framework-Tests-Overview */
 #include "cexpress.h"
 #include "db.h"
+#include "pin.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,6 +192,11 @@ static void handler_fortunes(const Request *req, Response *res) {
     db_submit_fortunes(res, done_fortunes);
 }
 
+/* app_on_worker_start hook: one CPU per worker (pin.h). */
+static void pin_this_worker(void) {
+    pin_worker(cluster_worker_id());
+}
+
 int main(void) {
     static App app;
     app_init(&app);
@@ -202,6 +208,10 @@ int main(void) {
      * json/plaintext container runs without a database. */
     const char *db_env = getenv("CEXPRESS_DB");
     if (db_env && strcmp(db_env, "1") == 0) {
+        const char *pin_env = getenv("CEXPRESS_PIN_WORKERS");
+        if (!pin_env || strcmp(pin_env, "0") != 0) {
+            app_on_worker_start(&app, pin_this_worker); /* before db_setup's hook: connect from the pinned CPU */
+        }
         db_setup(&app); /* per-worker connection, opened after fork */
         app_get(&app, "/db", handler_db);
         app_get(&app, "/queries", handler_queries);

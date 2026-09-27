@@ -116,8 +116,10 @@ static void flush_output(void) {
     watch(rc == 1 ? (WATCH_READ | WATCH_WRITE) : WATCH_READ);
 }
 
-/* Ends a request's queries (or a phase of them). With libpq 17+ the sync is only buffered and the turn-end
- * hook sends everything this event-loop turn queued in one flush; libpq 16's PQpipelineSync flushes itself. */
+/* Ends one statement: every query gets its own sync, so each runs in its own implicit transaction, exactly as
+ * in separate round trips (TFB general requirement #7). With libpq 17+ the sync is only buffered and the
+ * turn-end hook sends everything this event-loop turn queued in one flush; libpq 16's PQpipelineSync flushes
+ * itself. */
 static int pipeline_sync(void) {
     g_unsent = 1;
 #ifdef LIBPQ_HAS_SEND_PIPELINE_SYNC
@@ -141,18 +143,21 @@ static int cmp_world_id(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* Queues the n SELECTs of `job` and its sync. 0, or -1 (the connection refused: it is broken). */
-static int send_selects(const DbJob *job, const int *ids) {
+/* Queues the n SELECTs of `job`, each followed by its own sync. 0, or -1 (the connection refused: it is
+ * broken). */
+static int send_selects(DbJob *job, const int *ids) {
+    job->syncs_left = job->n;
     for (int i = 0; i < job->n; i++) {
         char id_text[12];
         snprintf(id_text, sizeof(id_text), "%d", ids[i]);
         const char *params[1] = {id_text};
-        if (!PQsendQueryPrepared(g_conn, "world", 1, params, NULL, NULL, 0)) return -1;
+        if (!PQsendQueryPrepared(g_conn, "world", 1, params, NULL, NULL, 0) || !pipeline_sync()) return -1;
     }
-    return pipeline_sync() ? 0 : -1;
+    return 0;
 }
 
-/* Queues one UPDATE ... FROM (VALUES ...) of job->worlds (prepared lazily per row count) and its sync. */
+/* Queues one UPDATE ... FROM (VALUES ...) of job->worlds and its sync; a lazy PREPARE (once per row count)
+ * goes first with a sync of its own. */
 static int send_update(DbJob *job) {
     /* Sorted ids make concurrent batches lock rows in the same order (no deadlocks). */
     World sorted[MAX_QUERIES];
@@ -162,6 +167,7 @@ static int send_update(DbJob *job) {
     char name[16];
     snprintf(name, sizeof(name), "upd%d", job->n);
     job->prepare_pending = 0;
+    job->syncs_left = 1;
     if (!update_prepared[job->n]) {
         static char sql[UPDATE_SQL_CAP];
         size_t off = (size_t)snprintf(sql, sizeof(sql), "UPDATE world SET randomnumber = v.r FROM (VALUES ");
@@ -169,9 +175,10 @@ static int send_update(DbJob *job) {
             off += (size_t)snprintf(sql + off, sizeof(sql) - off, "%s($%d::int,$%d::int)", i ? "," : "",
                                     2 * i + 1, 2 * i + 2);
         snprintf(sql + off, sizeof(sql) - off, ") AS v(id, r) WHERE world.id = v.id");
-        if (!PQsendPrepare(g_conn, name, sql, 0, NULL)) return -1;
+        if (!PQsendPrepare(g_conn, name, sql, 0, NULL) || !pipeline_sync()) return -1;
         update_prepared[job->n] = 1; /* in flight: later jobs are behind it in the pipeline */
         job->prepare_pending = 1;
+        job->syncs_left = 2;
     }
 
     static char text[2 * MAX_QUERIES][12];
@@ -186,7 +193,7 @@ static int send_update(DbJob *job) {
     return pipeline_sync() ? 0 : -1;
 }
 
-/* The head job's sync arrived: its current phase is complete. */
+/* The head job's last sync of its current phase arrived: the phase is complete. */
 static void phase_done(DbJob *job) {
     if (job->kind == DB_JOB_UPDATE_READ && !job->failed && job->got == job->n) {
         for (int i = 0; i < job->n; i++) {
@@ -216,7 +223,7 @@ static void on_result(PGresult *r) {
     const ExecStatusType status = PQresultStatus(r);
     if (status == PGRES_PIPELINE_SYNC) {
         PQclear(r);
-        phase_done(dequeue());
+        if (--job->syncs_left == 0) phase_done(dequeue());
         return;
     }
     switch (job->kind) {
@@ -380,6 +387,7 @@ static DbJob *job_begin(Response *res, const DbJobKind kind, const int n, const 
     job->got = 0;
     job->failed = 0;
     job->prepare_pending = 0;
+    job->syncs_left = 0;
     job->as_array = as_array;
     job->fortune_count = 0;
     job->pg_result = NULL;
@@ -413,6 +421,7 @@ void db_submit_updates(Response *res, const int *ids, const int n, DbDone done) 
 void db_submit_fortunes(Response *res, DbDone done) {
     DbJob *job = job_begin(res, DB_JOB_FORTUNES, 0, 0, done);
     if (job != NULL) {
+        job->syncs_left = 1;
         const int sent = PQsendQueryPrepared(g_conn, "fortune", 0, NULL, NULL, NULL, 0) && pipeline_sync();
         job_commit(job, sent ? 0 : -1);
     }
