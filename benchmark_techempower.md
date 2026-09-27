@@ -11,7 +11,7 @@ their wrk load generator, their request mix and concurrency levels. Every entry 
 | Docker | Colima VM, **10 CPUs, 12 GB**. Server, Postgres and wrk share it (TechEmpower uses 3 separate machines) |
 | Entries | `cexpress` / `cexpress-postgres`, `actix` / `actix-http`, `axum` / `axum-pg`, `h2o`, `fiber` |
 | Load | TFB defaults: 15 s per level; concurrency 16-512 (json, db, fortune), 512 (query, update, 1-20 queries), 256-16384 with pipelining 16 (plaintext) |
-| Runs | 4 full runs (2026-09-25/26), results under `techempower/.tfb/results/`: run 1 `20260926010854`, run 2 `20260926023941`, run 3 `20260926132736` (the four DB tests only), run 4 `20260926145131` (all six tests) |
+| Runs | 4 full runs (2026-09-25/26), results under `techempower/.tfb/results/`: run 1 `20260926010854`, run 2 `20260926023941`, run 3 `20260926132736` (the four DB tests only), run 4 `20260926145131` (all six tests); run 5 `20260926163928` (DB tests, CExpress variants + actix-http only) |
 
 What CExpress ran in each:
 
@@ -85,6 +85,135 @@ CExpress was 1st at every pipelined level in both (run 4: 4.78M / 4.81M / 4.09M 
 | axum-pg | 135,391 | 142,293 | 143,699 | 145,346 | 18,616 / 19,717 |
 | h2o | 118,694 | 139,556 | 126,403 | 143,981 | 15,267 / 17,402 |
 | fiber | 63,222 | 68,221 | 68,507 | 68,954 | 7,353 / 7,418 |
+
+## Runs 8 and 9: against Round 23's leaders (DB tests, two runs)
+
+`20260927062404` and `20260927075426`, 2026-09-27, back to back, same shipped CExpress build as run 7. Eight
+entries: run 7's five plus the Round 23 leaders on the DB tests (TFB's final official round, February 2025; the
+project was archived on 2026-03-24): `may-minihttp` (Round 23 #1 on db, query and fortune), `xitca-web` (#2 on update)
+and `xitca-web-barebone` (the archived repo's name for the stripped variant; Round 23's `xitca-web-unrealistic` was #1
+on update and #2-3 elsewhere). Local patches in TFB's checkout, needed to build and not touching server code:
+xitca-web's git dependencies moved from `http://` to `https://github.com` (plain http is refused from the Colima
+build). `ntex-db` (Round 23 #2 on db/query) was dropped: it has no lockfile and current ntex crates no longer compile
+with the archived code. Both xitca entries get a TFB WARN on update (about 2× the expected rows read); rows updated
+passes, and TFB still benchmarks WARN entries. Every test succeeded in both runs, zero 5xx.
+
+Average of runs 8 and 9 (best level; for query and update, the query count in the row name):
+
+| Test | cexpress | may-minihttp | xitca-web-barebone | actix-http | h2o | xitca-web | axum-pg | fiber | cexpress place | cexpress vs. leader |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| db | 324,083 | **330,599** | 328,840 | 322,961 | 310,653 | 307,675 | 306,846 | 129,556 | 3rd | 98.0% |
+| query, 1 query | 323,541 | **331,166** | 330,956 | 316,828 | 305,889 | 305,218 | 296,401 | 123,442 | 3rd | 97.7% |
+| query, 5 queries | **173,185** | 93,709 | 90,968 | 106,213 | 88,573 | 105,253 | 101,727 | 33,493 | **1st** | 1.63× actix-http |
+| query, 20 queries | **66,255** | 25,157 | 24,697 | 29,180 | 23,101 | 28,388 | 28,793 | 9,515 | **1st** | 2.27× actix-http |
+| fortune | 303,164 | 323,723 | **329,013** | 302,238 | 309,262 | 298,019 | 286,301 | 118,674 | 4th | 92.1% |
+| update, 1 query | **161,220** | 150,376 | 143,409 | 159,005 | 145,274 | 148,537 | 144,648 | 68,248 | **1st** | 1.01× actix-http |
+| update, 5 queries | **86,444** | 57,193 | 57,191 | 62,478 | 52,330 | 61,105 | 60,462 | 24,632 | **1st** | 1.38× actix-http |
+| update, 20 queries | **33,258** | 18,021 | 18,626 | 19,908 | 16,157 | 19,998 | 19,866 | 7,376 | **1st** | 1.66× xitca-web |
+
+- **db and single query:** a four-way race (may-minihttp, xitca-web-barebone, cexpress, actix-http) within 2.5%. The
+  order changes between the two runs (cexpress 5th then 2nd on db, 3rd both times on query), so no winner here.
+- **fortune: the one real gap.** cexpress is 7-9% behind both leaders in both runs (304k / 302k against 327k / 331k
+  and 327k / 320k), larger than the run-to-run spread of any entry but h2o. It is level with actix-http and ahead of
+  xitca-web (the non-stripped variant) and axum-pg.
+- **Multiple queries and updates: cexpress 1st at every count from 5 on**, 1.4-2.3× the next entry, and 1st on
+  single update in both runs. The Round 23 leaders fall behind actix-http here: they send a request's queries one
+  after another, while cexpress sends them in one round trip and shares the pipeline across requests.
+- Run-to-run spread of cexpress between runs 7, 8 and 9: under 3% on every test.
+
+## Run 7: all five frameworks, current code (DB tests)
+
+`20260927005504`, one run, 2026-09-27. The shipped build: one `PQflush` per event-loop turn, no A/B toggles, 1 worker
+per core, libpq 18.6. All five Postgres entries, db/query/fortune/update, every test succeeded, zero 5xx.
+
+| Test (best level) | cexpress | actix-http | axum-pg | h2o | fiber | cexpress place | vs. best other |
+|---|---:|---:|---:|---:|---:|---|---|
+| db | **330,950** | 328,594 | 309,173 | 300,771 | 129,869 | **1st** | 100.7% of actix-http |
+| query, 1 query | **327,943** | 320,815 | 300,067 | 283,701 | 121,838 | **1st** | 102.2% of actix-http |
+| query, 5 queries | **176,835** | 107,872 | 102,626 | 82,690 | 33,762 | **1st** | 1.64× |
+| query, 20 queries | **67,053** | 30,243 | 28,692 | 21,223 | 9,366 | **1st** | 2.22× |
+| fortune | 304,025 | **308,830** | 290,449 | 299,714 | 117,295 | 2nd | 98.4% of actix-http |
+| update, 1 query | 164,863 | **167,707** | 143,616 | 133,174 | 67,149 | 2nd | 98.3% of actix-http |
+| update, 5 queries | **88,361** | 64,473 | 60,732 | 50,355 | 24,449 | **1st** | 1.37× |
+| update, 20 queries | **33,768** | 19,686 | 19,658 | 16,026 | 7,418 | **1st** | 1.72× |
+
+Against run 4 (the last all-framework run, before the per-turn flush), CExpress moves from 4th to 1st on db
+(299,887 → 330,950) and from 4th to 2nd on fortune (275,448 → 304,025, now ahead of h2o). db, single query, fortune
+and single update are a two-way race with actix-http, every gap under 2%, far inside the ~15% single-run noise; from
+5 queries on CExpress leads query and update by 1.4-2.2×. As in run 4, actix-http is about 2× every other entry at
+16 connections (db 185k vs cexpress 91k, axum-pg 91k, h2o 111k), and the top entries track each other from 64 on.
+
+wrk socket timeouts: 0 for actix-http, 900-3,600 per test for each of the other four (cexpress in the same range),
+the harness pattern seen since run 3.
+
+## Run 6: eager flush of result-callback queries (A/B, db and update only)
+
+`20260926224646`, one run, 2026-09-26. Same engine and libpq 18.6 as run 5. Three entries in the same run, in the
+same order as run 5 (actix-http, then `cexpress-postgres`, then the variant), zero non-2xx:
+
+- `cexpress-postgres`: run 5's batched build, unchanged (one `PQflush` per event-loop turn).
+- `cexpress-postgres-eager`: the same binary with `CEXPRESS_PG_EAGER_CALLBACK=1`: when reading Postgres results
+  queued new queries (an `/updates` request's UPDATE, sent once its SELECTs complete), they are flushed right after
+  that read instead of at the end of the turn. Queries from handlers still wait for the turn-end flush.
+- `actix-http`: reference.
+
+| Test (level) | batched | eager | actix-http | eager / batched | batched, run 5 |
+|---|---:|---:|---:|---:|---:|
+| db (best, 512 conn.) | 320,914 | 326,795 | 303,456 | 1.02 | 321,196 |
+| db, 16 connections | 84,045 | 73,992 | 144,583 | 0.88 | 81,726 |
+| update, 1 query | 160,909 | 161,636 | 154,827 | 1.00 | 139,560 |
+| update, 5 queries | 85,093 | 85,768 | 61,086 | 1.01 | 69,951 |
+| update, 10 queries | 55,786 | 57,111 | 35,747 | 1.02 | 52,935 |
+| update, 15 queries | 41,525 | 42,700 | 24,798 | 1.03 | 40,278 |
+| update, 20 queries | 33,710 | 34,141 | 19,140 | 1.01 | 32,735 |
+
+**Run 5's update loss did not reproduce.** The unchanged batched build, in the same slot of the same test order,
+went from 139,560 to 160,909 at 1 query (+15%) and from 69,951 to 85,093 at 5 (+22%). It is now ahead of run 5's
+flush-each numbers (151,470 and 83,107) and of actix-http at every update count. Run 5's batched update rows were
+also its noisiest (at 5 queries: latency stdev 18.7 ms and max 241 ms, against 11.4 ms and 94 ms here), so the loss
+looks like a bad sample rather than a cost of batching.
+
+**Eager flush: no measurable effect.** Updates +0.5% to +2.8% at every count, which is inside run-to-run noise; average
+latency is lower at 1, 10, 15 and 20 queries (6.64 vs 6.88 ms at 1) and higher at 5 (9.65 vs 8.74 ms). On `/db`
+the eager variant runs exactly the batched code (no result callback queues anything), so its db column is an A/A
+comparison: 1-3% apart from 32 connections up and 12% apart at 16 connections, a direct measure of this setup's noise.
+
+wrk socket timeouts: 10 and 510 (batched, db at 16 and update at 20), 59 and 238 (eager, db at 64 and 256), 0 for
+actix-http. Every framework has them in runs 3 and 4 (e.g. actix-http 9-14k per run), usually about one per open
+connection at the affected level, with maximum latency ~110 ms, so they come from the harness and VM, not from a stuck request.
+
+## Run 5: worker count and batched Postgres flush (A/B, DB tests only)
+
+`20260926163928`, one run, 2026-09-26. Engine `288068e` + the turn-end hook (`app_on_turn_end`), libpq 18.6 from the
+PostgreSQL apt repository in every CExpress image. Four entries in the same run, zero non-2xx, zero wrk timeouts:
+
+- `cexpress-postgres`: queries buffered with `PQsendPipelineSync`, one `PQflush` per event-loop turn; 1 worker per core.
+- `cexpress-postgres-flusheach`: the same binary with `CEXPRESS_PG_FLUSH_EACH=1`, flushing after every request (the
+  behavior of runs 3 and 4).
+- `cexpress-postgres-w2x`: batched, 2 workers per core.
+- `actix-http`: reference.
+
+| Test (best level) | batched, 1× | flush each, 1× | batched, 2× | actix-http | batched / flush each | batched / 2× |
+|---|---:|---:|---:|---:|---:|---:|
+| db | 321,196 | 291,353 | 305,382 | 322,366 | **1.10** | 1.05 |
+| query, 1 query | 325,489 | 286,777 | 306,823 | 316,781 | **1.13** | 1.06 |
+| query, 20 queries | 66,963 | 64,349 | 64,525 | 29,254 | 1.04 | 1.04 |
+| fortune | 292,644 | 286,124 | 290,215 | 280,625 | 1.02 | 1.01 |
+| update, 1 query | 139,560 | 151,470 | 152,828 | 163,504 | **0.92** | 0.91 |
+| update, 20 queries | 32,735 | 32,084 | 31,518 | 19,702 | 1.02 | 1.04 |
+
+**Batched flush:** reads gain 10-13% on db and single-query at the best level; on db it is ahead at every level
+(+2% to +12%, smallest at 64 and 128 connections). Fortune +2% (noise). At 512 connections db latency drops from 4.67 to 2.60 ms. **Updates lose at
+1 and 5 queries** (140k vs 151k, 70k vs 83k; average latency 7.9 vs 7.0 ms and 12.6 vs 9.4 ms) and tie from 10 on.
+Unexplained so far. A likely cause (CODE, not measured): an `/updates` request's UPDATE is sent from the result
+callback, and with batching it waits for the end of that event-loop turn instead of going out at once, so each
+update request pays that wait on its second round trip.
+
+**Worker count:** 1 per core beats 2 per core on db (+5%), query (+6%) and ties fortune; 2 per core is ahead only on
+update, where it matches flush-each. The Dockerfile default stays at 1 per core.
+
+With batching, CExpress is level with actix-http on db (321k vs 322k) and ahead on query (325k vs 317k) and fortune
+(293k vs 281k) in this run, and behind on update at 1 query (140k vs 164k). One run; the update result needs a repeat. Repeated in run 6: the update loss did not reproduce.
 
 ## Run 4: does run 3's ranking hold?
 
@@ -175,7 +304,8 @@ leaders. The non-blocking app runs one worker per core and has not been swept ye
   worker serves other requests while its queries are in flight, and many requests share one pipelined connection. db
   and fortune are in a tie with Actix, Axum and h2o; query and update lead at every query count, by 1.4-2.3× from 5
   queries on.
-- **Open questions:** the worker count for the non-blocking app, fortune (the one DB test where CExpress trails the
-  leader by more than noise in both runs, 4-7%), and one `send` per event-loop turn to Postgres instead of one per
-  request.
+- **Batching Postgres output per event-loop turn** (run 5, one run) lifts db and single-query by 10-13% and costs
+  updates 8-16% at 1-5 queries. One worker per core stays the best setting.
+- **Open questions:** the update loss with batching, and fortune (4-7% behind h2o in runs 3 and 4, level with or
+  ahead of actix-http in run 5).
 - Everything ran on one laptop. Rankings within a run matter more than the absolute numbers.
